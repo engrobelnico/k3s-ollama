@@ -1,0 +1,205 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: opensearch-setup-rag
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: setup-rag
+          image: curlimages/curl:8.7.1
+          command:
+            - /bin/sh
+            - -c
+            - |
+              OS="https://opensearch.opensearch.svc.cluster.local:9200"
+              OLLAMA="http://ollama.ollama.svc.cluster.local:11434"
+              USER=$(cat /credentials/username)
+              PASS=$(cat /credentials/password)
+              CURL="curl -sk -u ${USER}:${PASS}"
+
+              # ─────────────────────────────────────────────────
+              # 0. Wait for OpenSearch and Ollama to be ready
+              # ─────────────────────────────────────────────────
+              echo "=== Waiting for OpenSearch..."
+              until $CURL "${OS}/_cluster/health" -o /dev/null; do sleep 10; done
+              echo "=== Waiting for Ollama..."
+              until curl -sf "${OLLAMA}/api/tags" -o /dev/null; do sleep 10; done
+              echo "=== Both ready."
+
+              # ─────────────────────────────────────────────────
+              # 1. Enable ML Commons on all nodes (single-node)
+              # ─────────────────────────────────────────────────
+              echo "=== Configuring ML Commons..."
+              $CURL -X PUT "${OS}/_cluster/settings" \
+                -H "Content-Type: application/json" -d '{
+                  "persistent": {
+                    "plugins.ml_commons.only_run_on_ml_node": false,
+                    "plugins.ml_commons.memory_feature_enabled": true,
+                    "plugins.ml_commons.rag_pipeline_feature_enabled": true
+                  }
+                }'
+
+              # ─────────────────────────────────────────────────
+              # 2. Create ML Connector → Ollama embeddings
+              # ─────────────────────────────────────────────────
+              echo ""
+              echo "=== Creating ML connector to Ollama..."
+              CONNECTOR=$($CURL -X POST "${OS}/_plugins/_ml/connectors/_create" \
+                -H "Content-Type: application/json" -d '{
+                  "name": "Ollama Embedding Connector",
+                  "description": "Connector to Ollama nomic-embed-text for embeddings",
+                  "version": "1",
+                  "protocol": "http",
+                  "parameters": {
+                    "model": "nomic-embed-text",
+                    "endpoint": "'"${OLLAMA}"'"
+                  },
+                  "actions": [{
+                    "action_type": "predict",
+                    "method": "POST",
+                    "url": "'"${OLLAMA}"'/api/embeddings",
+                    "headers": {"Content-Type": "application/json"},
+                    "request_body": "{\"model\": \"${parameters.model}\", \"prompt\": \"${parameters.input}\"}",
+                    "pre_process_function": "connector.pre_process.default.embedding",
+                    "post_process_function": "connector.post_process.default.embedding"
+                  }]
+                }')
+              echo "Connector response: ${CONNECTOR}"
+              CONNECTOR_ID=$(echo "${CONNECTOR}" | grep -o '"connector_id":"[^"]*"' | cut -d'"' -f4)
+              echo "Connector ID: ${CONNECTOR_ID}"
+
+              # ─────────────────────────────────────────────────
+              # 3. Pull nomic-embed-text model in Ollama
+              # ─────────────────────────────────────────────────
+              echo ""
+              echo "=== Pulling nomic-embed-text model in Ollama..."
+              curl -sf -X POST "${OLLAMA}/api/pull" \
+                -H "Content-Type: application/json" \
+                -d '{"name": "nomic-embed-text"}' || echo "Pull may already be in progress"
+
+              # ─────────────────────────────────────────────────
+              # 4. Register model in OpenSearch ML Commons
+              # ─────────────────────────────────────────────────
+              echo ""
+              echo "=== Registering embedding model..."
+              REGISTER=$($CURL -X POST "${OS}/_plugins/_ml/models/_register" \
+                -H "Content-Type: application/json" -d "{
+                  \"name\": \"nomic-embed-text\",
+                  \"version\": \"1\",
+                  \"function_name\": \"remote\",
+                  \"description\": \"Ollama nomic-embed-text embeddings (768 dimensions)\",
+                  \"connector_id\": \"${CONNECTOR_ID}\"
+                }")
+              echo "Register response: ${REGISTER}"
+              TASK_ID=$(echo "${REGISTER}" | grep -o '"task_id":"[^"]*"' | cut -d'"' -f4)
+
+              # Wait for model registration task
+              echo "Waiting for model registration task ${TASK_ID}..."
+              for i in $(seq 1 30); do
+                sleep 5
+                TASK=$($CURL "${OS}/_plugins/_ml/tasks/${TASK_ID}")
+                STATE=$(echo "${TASK}" | grep -o '"state":"[^"]*"' | cut -d'"' -f4)
+                echo "  Task state: ${STATE}"
+                if [ "${STATE}" = "COMPLETED" ]; then break; fi
+                if [ "${STATE}" = "FAILED" ]; then echo "Task failed!"; echo "${TASK}"; exit 1; fi
+              done
+              MODEL_ID=$(echo "${TASK}" | grep -o '"model_id":"[^"]*"' | cut -d'"' -f4)
+              echo "Model ID: ${MODEL_ID}"
+
+              # Deploy the model
+              echo "=== Deploying model..."
+              $CURL -X POST "${OS}/_plugins/_ml/models/${MODEL_ID}/_deploy" \
+                -H "Content-Type: application/json"
+              sleep 10
+
+              # ─────────────────────────────────────────────────
+              # 5. Create ingest pipeline with neural processor
+              # ─────────────────────────────────────────────────
+              echo ""
+              echo "=== Creating neural ingest pipeline..."
+              $CURL -X PUT "${OS}/_ingest/pipeline/rag-embedding-pipeline" \
+                -H "Content-Type: application/json" -d "{
+                  \"description\": \"Generate embeddings for RAG using Ollama nomic-embed-text\",
+                  \"processors\": [{
+                    \"text_embedding\": {
+                      \"model_id\": \"${MODEL_ID}\",
+                      \"field_map\": {
+                        \"text_chunk\": \"embedding\"
+                      }
+                    }
+                  }]
+                }"
+
+              # ─────────────────────────────────────────────────
+              # 6. Create kNN index for RAG
+              # ─────────────────────────────────────────────────
+              echo ""
+              echo "=== Creating rag-logs kNN index..."
+              $CURL -X PUT "${OS}/rag-logs" \
+                -H "Content-Type: application/json" -d '{
+                  "settings": {
+                    "index": {
+                      "knn": true,
+                      "knn.algo_param.ef_search": 100
+                    },
+                    "default_pipeline": "rag-embedding-pipeline",
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0
+                  },
+                  "mappings": {
+                    "properties": {
+                      "text_chunk":  { "type": "text" },
+                      "embedding": {
+                        "type": "knn_vector",
+                        "dimension": 768,
+                        "method": {
+                          "name": "hnsw",
+                          "space_type": "l2",
+                          "engine": "lucene"
+                        }
+                      },
+                      "timestamp":   { "type": "date" },
+                      "pod":         { "type": "keyword" },
+                      "namespace":   { "type": "keyword" },
+                      "container":   { "type": "keyword" },
+                      "log_level":   { "type": "keyword" },
+                      "source_index":{ "type": "keyword" }
+                    }
+                  }
+                }'
+
+              # Store model_id in a ConfigMap for use by the reindex job
+              echo ""
+              echo "=== Saving model_id for reindex job..."
+              cat > /tmp/model_id.txt <<EOF
+              ${MODEL_ID}
+              EOF
+
+              echo ""
+              echo "=== RAG setup complete!"
+              echo "    Connector ID: ${CONNECTOR_ID}"
+              echo "    Model ID:     ${MODEL_ID}"
+              echo "    Index:        rag-logs (kNN, 768 dims)"
+              echo "    Pipeline:     rag-embedding-pipeline"
+              echo ""
+              echo "Run the opensearch-reindex-rag job to populate rag-logs from otel-logs-*"
+          volumeMounts:
+            - name: credentials
+              mountPath: /credentials
+              readOnly: true
+      volumes:
+        - name: credentials
+          secret:
+            secretName: opensearch-admin-password
+            items:
+              - key: username
+                path: username
+              - key: password
+                path: password
