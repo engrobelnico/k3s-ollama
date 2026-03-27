@@ -1,14 +1,13 @@
 ollama:
-  
   extraEnv:
     - name: SSL_CERT_DIR
       value: "/etc/ssl/certs"
-  extraVolumes:
+  volumes:
     - name: host-ca-certs
       hostPath:
         path: /etc/ssl/certs
         type: Directory
-  extraVolumeMounts:
+  volumeMounts:
     - name: host-ca-certs
       mountPath: /etc/ssl/certs
       readOnly: true
