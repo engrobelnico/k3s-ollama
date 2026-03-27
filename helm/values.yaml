@@ -1,8 +1,17 @@
 ollama:
-  # Skip TLS verification for corporate proxy (LVMH PKI)
+  
   extraEnv:
-    - name: OLLAMA_SKIP_TLS_VERIFY
-      value: "true"
+    - name: SSL_CERT_DIR
+      value: "/etc/ssl/certs"
+  extraVolumes:
+    - name: host-ca-certs
+      hostPath:
+        path: /etc/ssl/certs
+        type: Directory
+  extraVolumeMounts:
+    - name: host-ca-certs
+      mountPath: /etc/ssl/certs
+      readOnly: true
 
   ollama:
     # Models to pull on startup — choose based on available RAM/CPU
