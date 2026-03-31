@@ -50,6 +50,18 @@ open-webui:
   extraEnvVars:
     - name: WEBUI_URL
       value: "http://ollama.kube.local"
+    # Default chat model — prevents nomic-embed-text from being selected
+    - name: DEFAULT_MODELS
+      value: "llama3.2:3b"
+    # Allow first-user admin signup (used by webui-setup-job)
+    - name: ENABLE_SIGNUP
+      value: "true"
+    # Admin credentials for setup job bootstrap
+    - name: WEBUI_ADMIN_EMAIL
+      valueFrom:
+        secretKeyRef:
+          name: open-webui-admin
+          key: email
     - name: OPENID_PROVIDER_URL
       value: ""
     # OpenSearch RAG configuration
@@ -81,6 +93,12 @@ open-webui:
 
   ingress:
     enabled: false  # We use our own Ingress template
+
+# Admin credentials for Open WebUI bootstrap (webui-setup-job)
+webui:
+  admin:
+    email: "admin@local.k3s"
+    password: "Admin@K3s!"  # Change this for production
 
   resources:
     requests:
