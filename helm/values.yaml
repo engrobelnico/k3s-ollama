@@ -95,10 +95,11 @@ open-webui:
     enabled: false  # We use our own Ingress template
 
 # Admin credentials for Open WebUI bootstrap (webui-setup-job)
+# The open-webui-admin secret is created once by Helm on first install and never overwritten.
+# To change the password: kubectl patch secret open-webui-admin -n ollama --type='merge' -p '{"data":{"password":"<base64>"}}')
 webui:
   admin:
     email: "admin@local.k3s"
-    password: "Admin@K3s!"  # Change this for production
 
   resources:
     requests:
