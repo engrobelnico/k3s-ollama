@@ -32,7 +32,7 @@ spec:
                 port:
                   number: 80
 ---
-# Static assets: SvelteKit generates absolute URLs (/_app, /api, /ws)
+# Static assets: SvelteKit generates absolute URLs (/_app, /static, /api, /ws, /manifest.json)
 # Route them directly to Open WebUI without stripping
 kind: Ingress
 apiVersion: networking.k8s.io/v1
@@ -50,6 +50,20 @@ spec:
         paths:
           - path: /_app
             pathType: Prefix
+            backend:
+              service:
+                name: ollama-open-webui
+                port:
+                  number: 80
+          - path: /static
+            pathType: Prefix
+            backend:
+              service:
+                name: ollama-open-webui
+                port:
+                  number: 80
+          - path: /manifest.json
+            pathType: Exact
             backend:
               service:
                 name: ollama-open-webui
