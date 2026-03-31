@@ -49,7 +49,7 @@ open-webui:
   # Base path for Traefik ingress at /ollama
   extraEnvVars:
     - name: WEBUI_URL
-      value: "http://kube.local/ollama"
+      value: "http://ollama.kube.local"
     - name: OPENID_PROVIDER_URL
       value: ""
     # OpenSearch RAG configuration
