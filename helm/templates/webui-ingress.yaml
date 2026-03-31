@@ -67,6 +67,13 @@ spec:
                 name: ollama-open-webui
                 port:
                   number: 80
+          - path: /assets
+            pathType: Prefix
+            backend:
+              service:
+                name: ollama-open-webui
+                port:
+                  number: 80
           - path: /static
             pathType: Prefix
             backend:
