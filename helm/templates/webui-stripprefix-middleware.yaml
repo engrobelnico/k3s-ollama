@@ -1,0 +1,10 @@
+# Middleware: strip the /ollama prefix before forwarding to Open WebUI
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: strip-ollama-prefix
+  namespace: ollama
+spec:
+  stripPrefix:
+    prefixes:
+      - /ollama
