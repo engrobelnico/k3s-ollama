@@ -37,7 +37,7 @@ spec:
               # ─────────────────────────────────────────────────
               # Helpers
               # ─────────────────────────────────────────────────
-              def api(method, url, data=None, headers=None, bearer=None, raw_data=None):
+              def api(method, url, data=None, headers=None, bearer=None, raw_data=None, timeout=30):
                   h = dict(headers or {})
                   if bearer:
                       h["Authorization"] = f"Bearer {bearer}"
@@ -47,7 +47,7 @@ spec:
                   req = Request(url, data=raw_data, headers=h, method=method)
                   ctx = ssl_ctx if url.startswith("https") else None
                   try:
-                      with urllib.request.urlopen(req, context=ctx, timeout=30) as r:
+                      with urllib.request.urlopen(req, context=ctx, timeout=timeout) as r:
                           return json.loads(r.read())
                   except urllib.error.HTTPError as e:
                       body = e.read().decode(errors="replace")
@@ -157,26 +157,33 @@ spec:
                   ).encode()
 
                   print(f"=== Uploading {len(hits)} log chunks to Open WebUI...")
-                  # process_in_background=false → synchronous processing so file.data
-                  # is populated before we call /file/add (avoids FILE_NOT_PROCESSED error)
+                  # Upload with background processing (avoids timeout on large files);
+                  # poll /process/status until completed before calling /file/add
                   file_resp = api(
-                      "POST", f"{WEBUI}/api/v1/files/?process_in_background=false",
+                      "POST", f"{WEBUI}/api/v1/files/",
                       headers={
                           "Content-Type": f"multipart/form-data; boundary={boundary}",
                           "Authorization": f"Bearer {token}"
                       },
-                      raw_data=parts
+                      raw_data=parts,
+                      timeout=120
                   )
                   file_id = file_resp.get("id")
                   if file_id:
-                      print(f"=== File uploaded: {file_id}")
-                      # Poll until processing is complete (status: completed/failed)
-                      for attempt in range(30):
+                      print(f"=== File uploaded: {file_id} — waiting for processing...")
+                      # Poll up to 5 min (60 × 5s) for background processing to complete
+                      for attempt in range(60):
+                          time.sleep(5)
                           st = api("GET", f"{WEBUI}/api/v1/files/{file_id}/process/status", bearer=token)
-                          print(f"    Processing status: {st}")
-                          if st.get("status") in ("completed", "failed", None, ""):
+                          status_val = st.get("status", "")
+                          print(f"    [{attempt+1}/60] status: {status_val}")
+                          if status_val == "completed":
                               break
-                          time.sleep(2)
+                          if status_val == "failed":
+                              print(f"  WARNING: File processing failed: {st}")
+                              break
+                      else:
+                          print("  WARNING: Processing did not complete in 5 min, proceeding anyway")
                       add_resp = api("POST", f"{WEBUI}/api/v1/knowledge/{kb_id}/file/add",
                           {"file_id": file_id}, bearer=token)
                       print(f"=== File added to knowledge base: {add_resp}")
