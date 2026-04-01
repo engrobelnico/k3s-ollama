@@ -116,57 +116,61 @@ spec:
                   if not kb_id:
                       raise SystemExit(f"Failed to create knowledge base: {kb}")
                   print(f"=== Created knowledge base: {kb_id}")
+              else:
+                  # Reset existing KB so stale files don't accumulate
+                  print("=== Resetting existing knowledge base files...")
+                  api("POST", f"{WEBUI}/api/v1/knowledge/{kb_id}/reset", bearer=token)
 
-                  # ────────────────────────────────────────────
-                  # 3. Fetch 500 most recent docs from rag-logs
-                  # ────────────────────────────────────────────
-                  print("=== Fetching documents from rag-logs OpenSearch index...")
-                  result = os_api("POST", "/rag-logs/_search", {
-                      "size": 500,
-                      "sort": [{"timestamp": {"order": "desc", "missing": "_last"}}],
-                      "_source": ["text_chunk", "pod", "namespace", "container", "log_level", "timestamp"]
-                  })
-                  hits = result.get("hits", {}).get("hits", [])
-                  print(f"    Found {len(hits)} documents in rag-logs")
+              # ────────────────────────────────────────────────
+              # 3. Always seed KB with latest docs from rag-logs
+              # ────────────────────────────────────────────────
+              print("=== Fetching documents from rag-logs OpenSearch index...")
+              result = os_api("POST", "/rag-logs/_search", {
+                  "size": 500,
+                  "sort": [{"timestamp": {"order": "desc", "missing": "_last"}}],
+                  "_source": ["text_chunk", "pod", "namespace", "container", "log_level", "timestamp"]
+              })
+              hits = result.get("hits", {}).get("hits", [])
+              print(f"    Found {len(hits)} documents in rag-logs")
 
-                  if hits:
-                      lines = []
-                      for hit in hits:
-                          s = hit.get("_source", {})
-                          ts  = s.get("timestamp", "")
-                          lvl = s.get("log_level", "")
-                          txt = s.get("text_chunk", "")
-                          lines.append(f"[{ts}] [{lvl}] {txt}")
-                      content = "\n".join(lines).encode()
+              if hits:
+                  lines = []
+                  for hit in hits:
+                      s = hit.get("_source", {})
+                      ts  = s.get("timestamp", "")
+                      lvl = s.get("log_level", "")
+                      txt = s.get("text_chunk", "")
+                      lines.append(f"[{ts}] [{lvl}] {txt}")
+                  content = "\n".join(lines).encode()
 
-                      # Upload as text file (multipart form-data)
-                      boundary = "----WebuiSetupBoundary12345"
-                      parts = (
-                          f"--{boundary}\r\n"
-                          f'Content-Disposition: form-data; name="file"; filename="rag-logs.txt"\r\n'
-                          f"Content-Type: text/plain\r\n\r\n"
-                      ).encode() + content + (
-                          f"\r\n--{boundary}--\r\n"
-                      ).encode()
+                  # Upload as text file (multipart form-data)
+                  boundary = "----WebuiSetupBoundary12345"
+                  parts = (
+                      f"--{boundary}\r\n"
+                      f'Content-Disposition: form-data; name="file"; filename="rag-logs.txt"\r\n'
+                      f"Content-Type: text/plain\r\n\r\n"
+                  ).encode() + content + (
+                      f"\r\n--{boundary}--\r\n"
+                  ).encode()
 
-                      print(f"=== Uploading {len(hits)} log chunks to Open WebUI...")
-                      file_resp = api(
-                          "POST", f"{WEBUI}/api/v1/files/",
-                          headers={
-                              "Content-Type": f"multipart/form-data; boundary={boundary}",
-                              "Authorization": f"Bearer {token}"
-                          },
-                          raw_data=parts
-                      )
-                      file_id = file_resp.get("id")
-                      if file_id:
-                          add_resp = api("POST", f"{WEBUI}/api/v1/knowledge/{kb_id}/file/add",
-                              {"file_id": file_id}, bearer=token)
-                          print(f"=== File added to knowledge base: status={add_resp.get('status', 'ok')}")
-                      else:
-                          print(f"  WARNING: File upload failed: {file_resp}")
+                  print(f"=== Uploading {len(hits)} log chunks to Open WebUI...")
+                  file_resp = api(
+                      "POST", f"{WEBUI}/api/v1/files/",
+                      headers={
+                          "Content-Type": f"multipart/form-data; boundary={boundary}",
+                          "Authorization": f"Bearer {token}"
+                      },
+                      raw_data=parts
+                  )
+                  file_id = file_resp.get("id")
+                  if file_id:
+                      add_resp = api("POST", f"{WEBUI}/api/v1/knowledge/{kb_id}/file/add",
+                          {"file_id": file_id}, bearer=token)
+                      print(f"=== File added to knowledge base: status={add_resp.get('status', 'ok')}")
                   else:
-                      print("  WARNING: rag-logs index empty — run reindex job first, then re-sync")
+                      print(f"  WARNING: File upload failed: {file_resp}")
+              else:
+                  print("  WARNING: rag-logs index empty — run reindex job first, then re-sync")
 
               # ─────────────────────────────────────────────────
               # 4. Create / update "Log Analyst" model
