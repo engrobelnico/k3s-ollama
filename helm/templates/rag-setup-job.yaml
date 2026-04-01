@@ -130,8 +130,9 @@ spec:
                       "description": "Connector to Ollama nomic-embed-text for embeddings",
                       "version": "1",
                       "protocol": "http",
-                      # credential is required by ML Commons even for unauthenticated HTTP endpoints
-                      "credential": {},
+                      # credential is required by ML Commons even for unauthenticated HTTP endpoints;
+                      # use a dummy key that is not referenced in the action template
+                      "credential": {"no_auth": "true"},
                       "parameters": {
                           "model": "nomic-embed-text",
                           "endpoint": OLLAMA
