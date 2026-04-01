@@ -73,48 +73,49 @@ spec:
                   sys.exit("No documents found in otel-logs-* — pipeline not writing logs yet")
               doc = hits[0].get("_source", {})
               print(f"    Sample doc keys: {list(doc.keys())}")
-              # Detect body field: data-prepper uses top-level 'body', not 'log.body'
-              body_field  = "body" if "body" in doc else ("log" if "log" in doc else "body")
+
+              # Detect body field
+              body_field = "body" if "body" in doc else "log"
               # Detect severity field
-              sev_field   = "severityText" if "severityText" in doc else ("severity" if "severity" in doc else "severityText")
-              # Detect resource pod field path
-              use_resource_obj = ("resource" in doc and isinstance(doc["resource"], dict)
-                                  and "attributes" in doc["resource"])
-              print(f"    body_field={body_field}, sev_field={sev_field}, resource_obj={use_resource_obj}")
+              sev_field = "severityText" if "severityText" in doc else ("severity" if "severity" in doc else "severityText")
+              # Detect timestamp field (data-prepper uses 'time', raw OTel uses '@timestamp')
+              ts_field = "time" if "time" in doc else ("observedTime" if "observedTime" in doc else "@timestamp")
+              # Detect resource field names — data-prepper flattens k8s.x.y as k8s@x@y
+              pod_key = next((k for k in doc if "pod" in k and "uid" not in k and "restart" not in k
+                              and k.startswith("resource")), None)
+              ns_key  = next((k for k in doc if "namespace" in k and k.startswith("resource")), None)
+              ctr_key = next((k for k in doc if "container" in k and "restart" not in k
+                              and k.startswith("resource")), None)
+              print(f"    body={body_field}, sev={sev_field}, ts={ts_field}")
+              print(f"    pod_key={pod_key}, ns_key={ns_key}, ctr_key={ctr_key}")
 
               # ─────────────────────────────────────────────────
-              # 2. Count source docs (last 7 days)
+              # 2. Count source docs
               # ─────────────────────────────────────────────────
               import time as _time
               SINCE_MS = int(_time.time() * 1000) - 7 * 86400 * 1000
               count_resp = os_req("POST", "/otel-logs-*/_count", {
-                  "query": {"range": {"@timestamp": {"gte": SINCE_MS}}}
+                  "query": {"range": {ts_field: {"gte": SINCE_MS}}}
               })
               src_count = count_resp.get("count", 0)
               print(f"    Source docs (last 7d): {src_count}")
               if src_count == 0:
-                  print("  WARNING: No docs in otel-logs-* for last 7 days — trying without time filter")
+                  print("  WARNING: No docs in last 7 days — reindexing all")
                   SINCE_MS = 0
 
-              # Build Painless script based on detected layout
-              # NOTE: in reindex scripts, document fields live in ctx['_source'].
-              #       ctx itself only holds metadata: _index, _id, _version, op, etc.
+              # Build Painless script — all doc fields via ctx['_source'], NOT ctx
+              # pipeline is bypassed via dest.pipeline="_none" so we only map text fields
               src = "ctx['_source']"
               if body_field == "log":
-                  body_expr = f"{src}.containsKey('log') && {src}['log'] instanceof Map && {src}['log'].containsKey('body') ? {src}['log']['body'].toString() : ''"
+                  body_expr = f"{src}.containsKey('log') && {src}['log'] instanceof Map ? {src}['log'].getOrDefault('body', '').toString() : ''"
               else:
                   body_expr = f"{src}.containsKey('body') ? {src}['body'].toString() : ''"
 
-              if use_resource_obj:
-                  pod_expr = f"{src}.containsKey('resource') && {src}['resource'] instanceof Map && {src}['resource'].containsKey('attributes') && {src}['resource']['attributes'] instanceof Map ? ({src}['resource']['attributes'].containsKey('k8s.pod.name') ? {src}['resource']['attributes']['k8s.pod.name'].toString() : '') : ''"
-                  ns_expr  = f"{src}.containsKey('resource') && {src}['resource'] instanceof Map && {src}['resource'].containsKey('attributes') && {src}['resource']['attributes'] instanceof Map ? ({src}['resource']['attributes'].containsKey('k8s.namespace.name') ? {src}['resource']['attributes']['k8s.namespace.name'].toString() : '') : ''"
-                  ctr_expr = f"{src}.containsKey('resource') && {src}['resource'] instanceof Map && {src}['resource'].containsKey('attributes') && {src}['resource']['attributes'] instanceof Map ? ({src}['resource']['attributes'].containsKey('k8s.container.name') ? {src}['resource']['attributes']['k8s.container.name'].toString() : '') : ''"
-              else:
-                  pod_expr = f"{src}.containsKey('resource.attributes.k8s.pod.name') ? {src}['resource.attributes.k8s.pod.name'].toString() : ''"
-                  ns_expr  = f"{src}.containsKey('resource.attributes.k8s.namespace.name') ? {src}['resource.attributes.k8s.namespace.name'].toString() : ''"
-                  ctr_expr = f"{src}.containsKey('resource.attributes.k8s.container.name') ? {src}['resource.attributes.k8s.container.name'].toString() : ''"
-
+              pod_expr = f"{src}.containsKey('{pod_key}') ? {src}['{pod_key}'].toString() : ''" if pod_key else "''"
+              ns_expr  = f"{src}.containsKey('{ns_key}') ? {src}['{ns_key}'].toString() : ''"  if ns_key  else "''"
+              ctr_expr = f"{src}.containsKey('{ctr_key}') ? {src}['{ctr_key}'].toString() : ''" if ctr_key else "''"
               sev_expr = f"{src}.containsKey('{sev_field}') ? {src}['{sev_field}'].toString() : 'UNKNOWN'"
+              ts_expr  = f"{src}.containsKey('{ts_field}') ? {src}['{ts_field}'].toString() : ''"
 
               painless = (
                   f"def src = ctx['_source']; "
@@ -123,18 +124,20 @@ spec:
                   f"String ns = {ns_expr}; "
                   f"String ctr = {ctr_expr}; "
                   f"String sev = {sev_expr}; "
+                  f"String ts = {ts_expr}; "
                   "src.text_chunk = '[' + ns + '/' + pod + '/' + ctr + '] ' + body; "
-                  "src.timestamp = src['@timestamp']; "
+                  "src.timestamp = ts; "
                   "src.pod = pod; src.namespace = ns; src.container = ctr; "
                   "src.log_level = sev; src.source_index = ctx['_index']; "
-                  "src.remove('@timestamp'); "
               )
 
               # ─────────────────────────────────────────────────
-              # 3. Synchronous reindex (wait_for_completion=true)
+              # 3. Synchronous reindex — bypass default pipeline
+              #    (rag-embedding-pipeline needs ingest node / ML node;
+              #     webui-setup-job only needs text_chunk, not vectors)
               # ─────────────────────────────────────────────────
-              query = {"range": {"@timestamp": {"gte": SINCE_MS}}} if SINCE_MS > 0 else {"match_all": {}}
-              print("=== Starting reindex otel-logs-* → rag-logs (synchronous)...")
+              query = {"range": {ts_field: {"gte": SINCE_MS}}} if SINCE_MS > 0 else {"match_all": {}}
+              print("=== Starting reindex otel-logs-* → rag-logs (synchronous, no pipeline)...")
               result = os_req("POST", "/_reindex?requests_per_second=50", {
                   "conflicts": "proceed",
                   "source": {
@@ -144,7 +147,7 @@ spec:
                   },
                   "dest": {
                       "index": "rag-logs",
-                      "pipeline": "rag-embedding-pipeline"
+                      "pipeline": "_none"   # bypass default_pipeline to avoid ingest node requirement
                   },
                   "script": {"lang": "painless", "source": painless}
               })
@@ -236,23 +239,23 @@ spec:
                   doc = hits[0].get("_source", {})
                   body_field = "body" if "body" in doc else "log"
                   sev_field  = "severityText" if "severityText" in doc else "severity"
-                  use_resource_obj = ("resource" in doc and isinstance(doc["resource"], dict)
-                                      and "attributes" in doc["resource"])
+                  ts_field   = "time" if "time" in doc else ("observedTime" if "observedTime" in doc else "@timestamp")
+                  pod_key = next((k for k in doc if "pod" in k and "uid" not in k and "restart" not in k
+                                  and k.startswith("resource")), None)
+                  ns_key  = next((k for k in doc if "namespace" in k and k.startswith("resource")), None)
+                  ctr_key = next((k for k in doc if "container" in k and "restart" not in k
+                                  and k.startswith("resource")), None)
 
                   src = "ctx['_source']"
                   if body_field == "log":
-                      body_expr = f"{src}.containsKey('log') && {src}['log'] instanceof Map && {src}['log'].containsKey('body') ? {src}['log']['body'].toString() : ''"
+                      body_expr = f"{src}.containsKey('log') && {src}['log'] instanceof Map ? {src}['log'].getOrDefault('body', '').toString() : ''"
                   else:
                       body_expr = f"{src}.containsKey('body') ? {src}['body'].toString() : ''"
-                  if use_resource_obj:
-                      pod_expr = f"{src}.containsKey('resource') && {src}['resource'] instanceof Map && {src}['resource'].containsKey('attributes') && {src}['resource']['attributes'] instanceof Map ? ({src}['resource']['attributes'].containsKey('k8s.pod.name') ? {src}['resource']['attributes']['k8s.pod.name'].toString() : '') : ''"
-                      ns_expr  = f"{src}.containsKey('resource') && {src}['resource'] instanceof Map && {src}['resource'].containsKey('attributes') && {src}['resource']['attributes'] instanceof Map ? ({src}['resource']['attributes'].containsKey('k8s.namespace.name') ? {src}['resource']['attributes']['k8s.namespace.name'].toString() : '') : ''"
-                      ctr_expr = f"{src}.containsKey('resource') && {src}['resource'] instanceof Map && {src}['resource'].containsKey('attributes') && {src}['resource']['attributes'] instanceof Map ? ({src}['resource']['attributes'].containsKey('k8s.container.name') ? {src}['resource']['attributes']['k8s.container.name'].toString() : '') : ''"
-                  else:
-                      pod_expr = f"{src}.containsKey('resource.attributes.k8s.pod.name') ? {src}['resource.attributes.k8s.pod.name'].toString() : ''"
-                      ns_expr  = f"{src}.containsKey('resource.attributes.k8s.namespace.name') ? {src}['resource.attributes.k8s.namespace.name'].toString() : ''"
-                      ctr_expr = f"{src}.containsKey('resource.attributes.k8s.container.name') ? {src}['resource.attributes.k8s.container.name'].toString() : ''"
+                  pod_expr = f"{src}.containsKey('{pod_key}') ? {src}['{pod_key}'].toString() : ''" if pod_key else "''"
+                  ns_expr  = f"{src}.containsKey('{ns_key}') ? {src}['{ns_key}'].toString() : ''"  if ns_key  else "''"
+                  ctr_expr = f"{src}.containsKey('{ctr_key}') ? {src}['{ctr_key}'].toString() : ''" if ctr_key else "''"
                   sev_expr = f"{src}.containsKey('{sev_field}') ? {src}['{sev_field}'].toString() : 'UNKNOWN'"
+                  ts_expr  = f"{src}.containsKey('{ts_field}') ? {src}['{ts_field}'].toString() : ''"
 
                   painless = (
                       f"def src = ctx['_source']; "
@@ -261,22 +264,25 @@ spec:
                       f"String ns = {ns_expr}; "
                       f"String ctr = {ctr_expr}; "
                       f"String sev = {sev_expr}; "
+                      f"String ts = {ts_expr}; "
                       "src.text_chunk = '[' + ns + '/' + pod + '/' + ctr + '] ' + body; "
-                      "src.timestamp = src['@timestamp']; "
+                      "src.timestamp = ts; "
                       "src.pod = pod; src.namespace = ns; src.container = ctr; "
                       "src.log_level = sev; src.source_index = ctx['_index']; "
-                      "src.remove('@timestamp'); "
                   )
 
-                  print("=== Incremental reindex otel-logs-* → rag-logs (last 2h)...")
+                  print("=== Incremental reindex otel-logs-* → rag-logs (last 2h, no pipeline)...")
                   result = os_req("POST", "/_reindex?requests_per_second=50", {
                       "conflicts": "proceed",
                       "source": {
                           "index": "otel-logs-*",
                           "size": 100,
-                          "query": {"range": {"@timestamp": {"gte": SINCE_MS}}}
+                          "query": {"range": {ts_field: {"gte": SINCE_MS}}}
                       },
-                      "dest": {"index": "rag-logs", "pipeline": "rag-embedding-pipeline"},
+                      "dest": {
+                          "index": "rag-logs",
+                          "pipeline": "_none"  # bypass default_pipeline (no ingest node needed)
+                      },
                       "script": {"lang": "painless", "source": painless}
                   })
                   print(f"    created={result.get('created',0)} updated={result.get('updated',0)} failures={len(result.get('failures',[]))}")
