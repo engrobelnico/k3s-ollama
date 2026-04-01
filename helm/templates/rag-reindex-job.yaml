@@ -97,34 +97,37 @@ spec:
                   SINCE_MS = 0
 
               # Build Painless script based on detected layout
+              # NOTE: in reindex scripts, document fields live in ctx['_source'].
+              #       ctx itself only holds metadata: _index, _id, _version, op, etc.
+              src = "ctx['_source']"
               if body_field == "log":
-                  body_expr = "ctx.containsKey('log') && ctx['log'] instanceof Map && ctx['log'].containsKey('body') ? ctx['log']['body'].toString() : ''"
+                  body_expr = f"{src}.containsKey('log') && {src}['log'] instanceof Map && {src}['log'].containsKey('body') ? {src}['log']['body'].toString() : ''"
               else:
-                  body_expr = "ctx.containsKey('body') ? ctx['body'].toString() : ''"
+                  body_expr = f"{src}.containsKey('body') ? {src}['body'].toString() : ''"
 
               if use_resource_obj:
-                  pod_expr = "ctx.containsKey('resource') && ctx['resource'] instanceof Map && ctx['resource'].containsKey('attributes') && ctx['resource']['attributes'] instanceof Map ? (ctx['resource']['attributes'].containsKey('k8s.pod.name') ? ctx['resource']['attributes']['k8s.pod.name'].toString() : '') : ''"
-                  ns_expr  = "ctx.containsKey('resource') && ctx['resource'] instanceof Map && ctx['resource'].containsKey('attributes') && ctx['resource']['attributes'] instanceof Map ? (ctx['resource']['attributes'].containsKey('k8s.namespace.name') ? ctx['resource']['attributes']['k8s.namespace.name'].toString() : '') : ''"
-                  ctr_expr = "ctx.containsKey('resource') && ctx['resource'] instanceof Map && ctx['resource'].containsKey('attributes') && ctx['resource']['attributes'] instanceof Map ? (ctx['resource']['attributes'].containsKey('k8s.container.name') ? ctx['resource']['attributes']['k8s.container.name'].toString() : '') : ''"
+                  pod_expr = f"{src}.containsKey('resource') && {src}['resource'] instanceof Map && {src}['resource'].containsKey('attributes') && {src}['resource']['attributes'] instanceof Map ? ({src}['resource']['attributes'].containsKey('k8s.pod.name') ? {src}['resource']['attributes']['k8s.pod.name'].toString() : '') : ''"
+                  ns_expr  = f"{src}.containsKey('resource') && {src}['resource'] instanceof Map && {src}['resource'].containsKey('attributes') && {src}['resource']['attributes'] instanceof Map ? ({src}['resource']['attributes'].containsKey('k8s.namespace.name') ? {src}['resource']['attributes']['k8s.namespace.name'].toString() : '') : ''"
+                  ctr_expr = f"{src}.containsKey('resource') && {src}['resource'] instanceof Map && {src}['resource'].containsKey('attributes') && {src}['resource']['attributes'] instanceof Map ? ({src}['resource']['attributes'].containsKey('k8s.container.name') ? {src}['resource']['attributes']['k8s.container.name'].toString() : '') : ''"
               else:
-                  # flattened: resource.attributes.k8s.pod.name stored as dotted key
-                  pod_expr = "ctx.containsKey('resource.attributes.k8s.pod.name') ? ctx['resource.attributes.k8s.pod.name'].toString() : ''"
-                  ns_expr  = "ctx.containsKey('resource.attributes.k8s.namespace.name') ? ctx['resource.attributes.k8s.namespace.name'].toString() : ''"
-                  ctr_expr = "ctx.containsKey('resource.attributes.k8s.container.name') ? ctx['resource.attributes.k8s.container.name'].toString() : ''"
+                  pod_expr = f"{src}.containsKey('resource.attributes.k8s.pod.name') ? {src}['resource.attributes.k8s.pod.name'].toString() : ''"
+                  ns_expr  = f"{src}.containsKey('resource.attributes.k8s.namespace.name') ? {src}['resource.attributes.k8s.namespace.name'].toString() : ''"
+                  ctr_expr = f"{src}.containsKey('resource.attributes.k8s.container.name') ? {src}['resource.attributes.k8s.container.name'].toString() : ''"
 
-              sev_expr = f"ctx.containsKey('{sev_field}') ? ctx['{sev_field}'].toString() : 'UNKNOWN'"
+              sev_expr = f"{src}.containsKey('{sev_field}') ? {src}['{sev_field}'].toString() : 'UNKNOWN'"
 
               painless = (
+                  f"def src = ctx['_source']; "
                   f"String body = {body_expr}; "
                   f"String pod = {pod_expr}; "
                   f"String ns = {ns_expr}; "
                   f"String ctr = {ctr_expr}; "
                   f"String sev = {sev_expr}; "
-                  "ctx.text_chunk = '[' + ns + '/' + pod + '/' + ctr + '] ' + body; "
-                  "ctx.timestamp = ctx['@timestamp']; "
-                  "ctx.pod = pod; ctx.namespace = ns; ctx.container = ctr; "
-                  "ctx.log_level = sev; ctx.source_index = ctx['_index']; "
-                  "ctx.remove('@timestamp'); "
+                  "src.text_chunk = '[' + ns + '/' + pod + '/' + ctr + '] ' + body; "
+                  "src.timestamp = src['@timestamp']; "
+                  "src.pod = pod; src.namespace = ns; src.container = ctr; "
+                  "src.log_level = sev; src.source_index = ctx['_index']; "
+                  "src.remove('@timestamp'); "
               )
 
               # ─────────────────────────────────────────────────
@@ -236,31 +239,33 @@ spec:
                   use_resource_obj = ("resource" in doc and isinstance(doc["resource"], dict)
                                       and "attributes" in doc["resource"])
 
+                  src = "ctx['_source']"
                   if body_field == "log":
-                      body_expr = "ctx.containsKey('log') && ctx['log'] instanceof Map && ctx['log'].containsKey('body') ? ctx['log']['body'].toString() : ''"
+                      body_expr = f"{src}.containsKey('log') && {src}['log'] instanceof Map && {src}['log'].containsKey('body') ? {src}['log']['body'].toString() : ''"
                   else:
-                      body_expr = "ctx.containsKey('body') ? ctx['body'].toString() : ''"
+                      body_expr = f"{src}.containsKey('body') ? {src}['body'].toString() : ''"
                   if use_resource_obj:
-                      pod_expr = "ctx.containsKey('resource') && ctx['resource'] instanceof Map && ctx['resource'].containsKey('attributes') && ctx['resource']['attributes'] instanceof Map ? (ctx['resource']['attributes'].containsKey('k8s.pod.name') ? ctx['resource']['attributes']['k8s.pod.name'].toString() : '') : ''"
-                      ns_expr  = "ctx.containsKey('resource') && ctx['resource'] instanceof Map && ctx['resource'].containsKey('attributes') && ctx['resource']['attributes'] instanceof Map ? (ctx['resource']['attributes'].containsKey('k8s.namespace.name') ? ctx['resource']['attributes']['k8s.namespace.name'].toString() : '') : ''"
-                      ctr_expr = "ctx.containsKey('resource') && ctx['resource'] instanceof Map && ctx['resource'].containsKey('attributes') && ctx['resource']['attributes'] instanceof Map ? (ctx['resource']['attributes'].containsKey('k8s.container.name') ? ctx['resource']['attributes']['k8s.container.name'].toString() : '') : ''"
+                      pod_expr = f"{src}.containsKey('resource') && {src}['resource'] instanceof Map && {src}['resource'].containsKey('attributes') && {src}['resource']['attributes'] instanceof Map ? ({src}['resource']['attributes'].containsKey('k8s.pod.name') ? {src}['resource']['attributes']['k8s.pod.name'].toString() : '') : ''"
+                      ns_expr  = f"{src}.containsKey('resource') && {src}['resource'] instanceof Map && {src}['resource'].containsKey('attributes') && {src}['resource']['attributes'] instanceof Map ? ({src}['resource']['attributes'].containsKey('k8s.namespace.name') ? {src}['resource']['attributes']['k8s.namespace.name'].toString() : '') : ''"
+                      ctr_expr = f"{src}.containsKey('resource') && {src}['resource'] instanceof Map && {src}['resource'].containsKey('attributes') && {src}['resource']['attributes'] instanceof Map ? ({src}['resource']['attributes'].containsKey('k8s.container.name') ? {src}['resource']['attributes']['k8s.container.name'].toString() : '') : ''"
                   else:
-                      pod_expr = "ctx.containsKey('resource.attributes.k8s.pod.name') ? ctx['resource.attributes.k8s.pod.name'].toString() : ''"
-                      ns_expr  = "ctx.containsKey('resource.attributes.k8s.namespace.name') ? ctx['resource.attributes.k8s.namespace.name'].toString() : ''"
-                      ctr_expr = "ctx.containsKey('resource.attributes.k8s.container.name') ? ctx['resource.attributes.k8s.container.name'].toString() : ''"
-                  sev_expr = f"ctx.containsKey('{sev_field}') ? ctx['{sev_field}'].toString() : 'UNKNOWN'"
+                      pod_expr = f"{src}.containsKey('resource.attributes.k8s.pod.name') ? {src}['resource.attributes.k8s.pod.name'].toString() : ''"
+                      ns_expr  = f"{src}.containsKey('resource.attributes.k8s.namespace.name') ? {src}['resource.attributes.k8s.namespace.name'].toString() : ''"
+                      ctr_expr = f"{src}.containsKey('resource.attributes.k8s.container.name') ? {src}['resource.attributes.k8s.container.name'].toString() : ''"
+                  sev_expr = f"{src}.containsKey('{sev_field}') ? {src}['{sev_field}'].toString() : 'UNKNOWN'"
 
                   painless = (
+                      f"def src = ctx['_source']; "
                       f"String body = {body_expr}; "
                       f"String pod = {pod_expr}; "
                       f"String ns = {ns_expr}; "
                       f"String ctr = {ctr_expr}; "
                       f"String sev = {sev_expr}; "
-                      "ctx.text_chunk = '[' + ns + '/' + pod + '/' + ctr + '] ' + body; "
-                      "ctx.timestamp = ctx['@timestamp']; "
-                      "ctx.pod = pod; ctx.namespace = ns; ctx.container = ctr; "
-                      "ctx.log_level = sev; ctx.source_index = ctx['_index']; "
-                      "ctx.remove('@timestamp'); "
+                      "src.text_chunk = '[' + ns + '/' + pod + '/' + ctr + '] ' + body; "
+                      "src.timestamp = src['@timestamp']; "
+                      "src.pod = pod; src.namespace = ns; src.container = ctr; "
+                      "src.log_level = sev; src.source_index = ctx['_index']; "
+                      "src.remove('@timestamp'); "
                   )
 
                   print("=== Incremental reindex otel-logs-* → rag-logs (last 2h)...")
