@@ -94,15 +94,15 @@ spec:
               print(f"=== Authenticated (token ...{token[-8:]})")
 
               # ─────────────────────────────────────────────────
-              # 2. Delete any existing "rag-logs" KB, then recreate
+              # 2. Delete ALL existing "rag-logs" KBs, then recreate
               # ─────────────────────────────────────────────────
               print("=== Checking existing knowledge collections...")
-              kbs_raw = api("GET", f"{WEBUI}/api/v1/knowledge", bearer=token)
-              # Response may be a list or wrapped in a dict (e.g. {"knowledge": [...]})
+              kbs_raw = api("GET", f"{WEBUI}/api/v1/knowledge/", bearer=token)
+              # Response is {"items": [...], "total": N}
               if isinstance(kbs_raw, list):
                   kbs = kbs_raw
               elif isinstance(kbs_raw, dict):
-                  kbs = kbs_raw.get("knowledge", kbs_raw.get("items", kbs_raw.get("data", [])))
+                  kbs = kbs_raw.get("items", kbs_raw.get("knowledge", kbs_raw.get("data", [])))
               else:
                   kbs = []
               print(f"    Found {len(kbs)} existing knowledge bases")
@@ -110,8 +110,9 @@ spec:
                   if k.get("name") == "rag-logs":
                       old_id = k["id"]
                       print(f"=== Deleting stale knowledge base: {old_id}")
-                      api("DELETE", f"{WEBUI}/api/v1/knowledge/{old_id}", bearer=token)
-                      break
+                      # correct endpoint is DELETE /{id}/delete
+                      del_resp = api("DELETE", f"{WEBUI}/api/v1/knowledge/{old_id}/delete", bearer=token)
+                      print(f"    Delete response: {del_resp}")
 
               print("=== Creating knowledge collection 'rag-logs'...")
               kb = api("POST", f"{WEBUI}/api/v1/knowledge/create", {
@@ -156,8 +157,10 @@ spec:
                   ).encode()
 
                   print(f"=== Uploading {len(hits)} log chunks to Open WebUI...")
+                  # process_in_background=false → synchronous processing so file.data
+                  # is populated before we call /file/add (avoids FILE_NOT_PROCESSED error)
                   file_resp = api(
-                      "POST", f"{WEBUI}/api/v1/files/",
+                      "POST", f"{WEBUI}/api/v1/files/?process_in_background=false",
                       headers={
                           "Content-Type": f"multipart/form-data; boundary={boundary}",
                           "Authorization": f"Bearer {token}"
@@ -167,6 +170,13 @@ spec:
                   file_id = file_resp.get("id")
                   if file_id:
                       print(f"=== File uploaded: {file_id}")
+                      # Poll until processing is complete (status: completed/failed)
+                      for attempt in range(30):
+                          st = api("GET", f"{WEBUI}/api/v1/files/{file_id}/process/status", bearer=token)
+                          print(f"    Processing status: {st}")
+                          if st.get("status") in ("completed", "failed", None, ""):
+                              break
+                          time.sleep(2)
                       add_resp = api("POST", f"{WEBUI}/api/v1/knowledge/{kb_id}/file/add",
                           {"file_id": file_id}, bearer=token)
                       print(f"=== File added to knowledge base: {add_resp}")
