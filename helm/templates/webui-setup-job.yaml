@@ -4,9 +4,10 @@ metadata:
   name: webui-setup
   namespace: {{ .Release.Namespace }}
   annotations:
-    # Must run after opensearch-setup-rag and opensearch-reindex-rag (alphabetical order: w > o)
+    # Runs after opensearch-setup-rag (wave 1) and opensearch-reindex-rag (wave 2)
     argocd.argoproj.io/hook: PostSync
     argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "3"
 spec:
   ttlSecondsAfterFinished: 600
   template:

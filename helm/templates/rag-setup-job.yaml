@@ -6,6 +6,7 @@ metadata:
   annotations:
     argocd.argoproj.io/hook: PostSync
     argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "1"
 spec:
   ttlSecondsAfterFinished: 600
   template:
@@ -222,46 +223,42 @@ spec:
               # ─────────────────────────────────────────────────
               # 6. Create kNN index (idempotent — skip if exists)
               # ─────────────────────────────────────────────────
-              exists = os_req("HEAD", "/rag-logs")
-              if exists.get("status", 0) != 404 and not isinstance(exists, dict):
+              idx_check = os_req("GET", "/rag-logs")
+              if "rag-logs" in idx_check:
                   print("=== rag-logs index already exists, skipping creation.")
               else:
-                  idx_check = os_req("GET", "/rag-logs")
-                  if "rag-logs" in idx_check:
-                      print("=== rag-logs index already exists, skipping creation.")
-                  else:
-                      print("=== Creating rag-logs kNN index...")
-                      os_req("PUT", "/rag-logs", {
-                          "settings": {
-                              "index": {
-                                  "knn": True,
-                                  "knn.algo_param.ef_search": 100
-                              },
-                              "default_pipeline": "rag-embedding-pipeline",
-                              "number_of_shards": 1,
-                              "number_of_replicas": 0
+                  print("=== Creating rag-logs kNN index...")
+                  os_req("PUT", "/rag-logs", {
+                      "settings": {
+                          "index": {
+                              "knn": True,
+                              "knn.algo_param.ef_search": 100
                           },
-                          "mappings": {
-                              "properties": {
-                                  "text_chunk":   {"type": "text"},
-                                  "embedding": {
-                                      "type": "knn_vector",
-                                      "dimension": 768,
-                                      "method": {
-                                          "name": "hnsw",
-                                          "space_type": "l2",
-                                          "engine": "lucene"
-                                      }
-                                  },
-                                  "timestamp":    {"type": "date"},
-                                  "pod":          {"type": "keyword"},
-                                  "namespace":    {"type": "keyword"},
-                                  "container":    {"type": "keyword"},
-                                  "log_level":    {"type": "keyword"},
-                                  "source_index": {"type": "keyword"}
-                              }
+                          "default_pipeline": "rag-embedding-pipeline",
+                          "number_of_shards": 1,
+                          "number_of_replicas": 0
+                      },
+                      "mappings": {
+                          "properties": {
+                              "text_chunk":   {"type": "text"},
+                              "embedding": {
+                                  "type": "knn_vector",
+                                  "dimension": 768,
+                                  "method": {
+                                      "name": "hnsw",
+                                      "space_type": "l2",
+                                      "engine": "lucene"
+                                  }
+                              },
+                              "timestamp":    {"type": "date"},
+                              "pod":          {"type": "keyword"},
+                              "namespace":    {"type": "keyword"},
+                              "container":    {"type": "keyword"},
+                              "log_level":    {"type": "keyword"},
+                              "source_index": {"type": "keyword"}
                           }
-                      })
+                      }
+                  })
 
               print("")
               print("=== RAG setup complete!")

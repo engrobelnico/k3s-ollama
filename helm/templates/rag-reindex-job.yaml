@@ -6,9 +6,10 @@ metadata:
   name: opensearch-reindex-rag
   namespace: {{ .Release.Namespace }}
   annotations:
-    # Runs after setup job — trigger manually or adjust hook name
+    # Runs after setup job (wave 1)
     argocd.argoproj.io/hook: PostSync
     argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "2"
 spec:
   ttlSecondsAfterFinished: 600
   template:
