@@ -91,7 +91,11 @@ spec:
                   "persistent": {
                       "plugins.ml_commons.only_run_on_ml_node": False,
                       "plugins.ml_commons.memory_feature_enabled": True,
-                      "plugins.ml_commons.rag_pipeline_feature_enabled": True
+                      "plugins.ml_commons.rag_pipeline_feature_enabled": True,
+                      # Allow connector to reach Ollama inside the cluster
+                      "plugins.ml_commons.trusted_connector_endpoints_regex": [
+                          "^http://ollama\\.ollama\\.svc\\.cluster\\.local:11434/.*$"
+                      ]
                   }
               })
 
