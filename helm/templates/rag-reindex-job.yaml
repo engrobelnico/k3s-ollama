@@ -94,15 +94,16 @@ spec:
               # 2. Count source docs
               # ─────────────────────────────────────────────────
               import time as _time
-              SINCE_MS = int(_time.time() * 1000) - 7 * 86400 * 1000
+              from datetime import datetime, timedelta, timezone
+              SINCE_ISO = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
               count_resp = os_req("POST", "/otel-logs-*/_count", {
-                  "query": {"range": {ts_field: {"gte": SINCE_MS}}}
+                  "query": {"range": {ts_field: {"gte": SINCE_ISO}}}
               })
               src_count = count_resp.get("count", 0)
-              print(f"    Source docs (last 7d): {src_count}")
+              print(f"    Source docs (last 7d, since {SINCE_ISO}): {src_count}")
               if src_count == 0:
                   print("  WARNING: No docs in last 7 days — reindexing all")
-                  SINCE_MS = 0
+                  SINCE_ISO = None
 
               # Build Painless script — all doc fields via ctx['_source'], NOT ctx
               # pipeline is bypassed via dest.pipeline="_none" so we only map text fields
@@ -137,9 +138,9 @@ spec:
               #    (rag-embedding-pipeline needs ingest node / ML node;
               #     webui-setup-job only needs text_chunk, not vectors)
               # ─────────────────────────────────────────────────
-              query = {"range": {ts_field: {"gte": SINCE_MS}}} if SINCE_MS > 0 else {"match_all": {}}
+              query = {"range": {ts_field: {"gte": SINCE_ISO}}} if SINCE_ISO else {"match_all": {}}
               print("=== Submitting reindex otel-logs-* → rag-logs (async, no pipeline)...")
-              resp = os_req("POST", "/_reindex?wait_for_completion=false&requests_per_second=50", {
+              resp = os_req("POST", "/_reindex?wait_for_completion=false&requests_per_second=500", {
                   "conflicts": "proceed",
                   "source": {
                       "index": "otel-logs-*",
@@ -244,7 +245,8 @@ spec:
                           print(f"  ERROR {method} {path}: {e}")
                           return {}
 
-                  SINCE_MS = int(time.time() * 1000) - 7200 * 1000
+                  from datetime import datetime, timedelta, timezone
+                  SINCE_ISO = (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
                   # Detect field layout from a sample doc
                   sample = os_req("POST", "/otel-logs-*/_search", {"size": 1})
@@ -286,13 +288,13 @@ spec:
                       "src.log_level = sev; src.source_index = ctx['_index']; "
                   )
 
-                  print("=== Incremental reindex otel-logs-* → rag-logs (last 2h, no pipeline)...")
-                  result = os_req("POST", "/_reindex?requests_per_second=50", {
+                  print(f"=== Incremental reindex otel-logs-* → rag-logs (last 2h, since {SINCE_ISO}, no pipeline)...")
+                  result = os_req("POST", "/_reindex?requests_per_second=500", {
                       "conflicts": "proceed",
                       "source": {
                           "index": "otel-logs-*",
                           "size": 100,
-                          "query": {"range": {ts_field: {"gte": SINCE_MS}}}
+                          "query": {"range": {ts_field: {"gte": SINCE_ISO}}}
                       },
                       "dest": {
                           "index": "rag-logs",
