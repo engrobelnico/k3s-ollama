@@ -13,183 +13,257 @@ spec:
       restartPolicy: OnFailure
       containers:
         - name: setup-rag
-          image: curlimages/curl:8.7.1
+          image: python:3.11-alpine
           command:
-            - /bin/sh
+            - python3
             - -c
             - |
-              OS="https://opensearch.opensearch.svc.cluster.local:9200"
-              OLLAMA="http://ollama.ollama.svc.cluster.local:11434"
-              USER=$(cat /credentials/username)
-              PASS=$(cat /credentials/password)
-              CURL="curl -sk -u ${USER}:${PASS}"
+              import urllib.request, urllib.error, json, time, ssl, base64, sys
+              from urllib.request import Request
+
+              OS     = "https://opensearch.opensearch.svc.cluster.local:9200"
+              OLLAMA = "http://ollama.ollama.svc.cluster.local:11434"
+
+              with open("/credentials/username") as f: USER = f.read().strip()
+              with open("/credentials/password") as f: PASS = f.read().strip()
+
+              ssl_ctx = ssl.create_default_context()
+              ssl_ctx.check_hostname = False
+              ssl_ctx.verify_mode = ssl.CERT_NONE
+
+              def os_req(method, path, data=None):
+                  creds = base64.b64encode(f"{USER}:{PASS}".encode()).decode()
+                  h = {"Authorization": f"Basic {creds}"}
+                  raw = None
+                  if data is not None:
+                      raw = json.dumps(data).encode()
+                      h["Content-Type"] = "application/json"
+                  req = Request(f"{OS}{path}", data=raw, headers=h, method=method)
+                  try:
+                      with urllib.request.urlopen(req, context=ssl_ctx, timeout=30) as r:
+                          return json.loads(r.read())
+                  except urllib.error.HTTPError as e:
+                      body = e.read().decode(errors="replace")
+                      print(f"  HTTP {e.code} {method} {path}: {body[:300]}")
+                      return {}
+                  except Exception as e:
+                      print(f"  ERROR {method} {path}: {e}")
+                      return {}
+
+              def ollama_req(method, path, data=None):
+                  raw = json.dumps(data).encode() if data else None
+                  h = {"Content-Type": "application/json"} if data else {}
+                  req = Request(f"{OLLAMA}{path}", data=raw, headers=h, method=method)
+                  try:
+                      with urllib.request.urlopen(req, timeout=60) as r:
+                          return json.loads(r.read())
+                  except Exception as e:
+                      print(f"  ERROR {method} {path}: {e}")
+                      return {}
 
               # ─────────────────────────────────────────────────
-              # 0. Wait for OpenSearch and Ollama to be ready
+              # 0. Wait for OpenSearch and Ollama
               # ─────────────────────────────────────────────────
-              echo "=== Waiting for OpenSearch..."
-              until $CURL "${OS}/_cluster/health" -o /dev/null; do sleep 10; done
-              echo "=== Waiting for Ollama..."
-              until curl -sf "${OLLAMA}/api/tags" -o /dev/null; do sleep 10; done
-              echo "=== Both ready."
+              print("=== Waiting for OpenSearch...")
+              for _ in range(60):
+                  r = os_req("GET", "/_cluster/health")
+                  if r.get("status") in ("green", "yellow"):
+                      break
+                  time.sleep(10)
+              else:
+                  sys.exit("OpenSearch not ready after 10 min")
+              print("=== Waiting for Ollama...")
+              for _ in range(60):
+                  try:
+                      urllib.request.urlopen(f"{OLLAMA}/api/tags", timeout=5)
+                      break
+                  except Exception:
+                      time.sleep(5)
+              else:
+                  sys.exit("Ollama not ready after 5 min")
+              print("=== Both ready.")
 
               # ─────────────────────────────────────────────────
               # 1. Enable ML Commons on all nodes (single-node)
               # ─────────────────────────────────────────────────
-              echo "=== Configuring ML Commons..."
-              $CURL -X PUT "${OS}/_cluster/settings" \
-                -H "Content-Type: application/json" -d '{
+              print("=== Configuring ML Commons...")
+              os_req("PUT", "/_cluster/settings", {
                   "persistent": {
-                    "plugins.ml_commons.only_run_on_ml_node": false,
-                    "plugins.ml_commons.memory_feature_enabled": true,
-                    "plugins.ml_commons.rag_pipeline_feature_enabled": true
+                      "plugins.ml_commons.only_run_on_ml_node": False,
+                      "plugins.ml_commons.memory_feature_enabled": True,
+                      "plugins.ml_commons.rag_pipeline_feature_enabled": True
                   }
-                }'
+              })
 
               # ─────────────────────────────────────────────────
-              # 2. Create ML Connector → Ollama embeddings
+              # 2. Pull nomic-embed-text in Ollama (idempotent)
               # ─────────────────────────────────────────────────
-              echo ""
-              echo "=== Creating ML connector to Ollama..."
-              CONNECTOR=$($CURL -X POST "${OS}/_plugins/_ml/connectors/_create" \
-                -H "Content-Type: application/json" -d '{
-                  "name": "Ollama Embedding Connector",
-                  "description": "Connector to Ollama nomic-embed-text for embeddings",
-                  "version": "1",
-                  "protocol": "http",
-                  "parameters": {
-                    "model": "nomic-embed-text",
-                    "endpoint": "'"${OLLAMA}"'"
-                  },
-                  "actions": [{
-                    "action_type": "predict",
-                    "method": "POST",
-                    "url": "'"${OLLAMA}"'/api/embeddings",
-                    "headers": {"Content-Type": "application/json"},
-                    "request_body": "{\"model\": \"${parameters.model}\", \"prompt\": \"${parameters.input}\"}",
-                    "pre_process_function": "connector.pre_process.default.embedding",
-                    "post_process_function": "connector.post_process.default.embedding"
-                  }]
-                }')
-              echo "Connector response: ${CONNECTOR}"
-              CONNECTOR_ID=$(echo "${CONNECTOR}" | grep -o '"connector_id":"[^"]*"' | cut -d'"' -f4)
-              echo "Connector ID: ${CONNECTOR_ID}"
+              print("=== Pulling nomic-embed-text in Ollama...")
+              tags = ollama_req("GET", "/api/tags")
+              models_present = [m.get("name","") for m in tags.get("models", [])]
+              if any("nomic-embed-text" in m for m in models_present):
+                  print("    Already present, skipping pull.")
+              else:
+                  ollama_req("POST", "/api/pull", {"name": "nomic-embed-text", "stream": False})
+                  print("    Pull complete.")
 
               # ─────────────────────────────────────────────────
-              # 3. Pull nomic-embed-text model in Ollama
+              # 3. Create ML Connector (idempotent by name search)
               # ─────────────────────────────────────────────────
-              echo ""
-              echo "=== Pulling nomic-embed-text model in Ollama..."
-              curl -sf -X POST "${OLLAMA}/api/pull" \
-                -H "Content-Type: application/json" \
-                -d '{"name": "nomic-embed-text"}' || echo "Pull may already be in progress"
+              CONNECTOR_NAME = "Ollama Embedding Connector"
+              connector_id = None
 
-              # ─────────────────────────────────────────────────
-              # 4. Register model in OpenSearch ML Commons
-              # ─────────────────────────────────────────────────
-              echo ""
-              echo "=== Registering embedding model..."
-              REGISTER=$($CURL -X POST "${OS}/_plugins/_ml/models/_register" \
-                -H "Content-Type: application/json" -d "{
-                  \"name\": \"nomic-embed-text\",
-                  \"version\": \"1\",
-                  \"function_name\": \"remote\",
-                  \"description\": \"Ollama nomic-embed-text embeddings (768 dimensions)\",
-                  \"connector_id\": \"${CONNECTOR_ID}\"
-                }")
-              echo "Register response: ${REGISTER}"
-              TASK_ID=$(echo "${REGISTER}" | grep -o '"task_id":"[^"]*"' | cut -d'"' -f4)
+              # Search existing connectors
+              search_resp = os_req("POST", "/_plugins/_ml/connectors/_search", {
+                  "query": {"match": {"name": CONNECTOR_NAME}}
+              })
+              for hit in search_resp.get("hits", {}).get("hits", []):
+                  if hit.get("_source", {}).get("name") == CONNECTOR_NAME:
+                      connector_id = hit["_id"]
+                      print(f"=== Reusing existing connector: {connector_id}")
+                      break
 
-              # Wait for model registration task
-              echo "Waiting for model registration task ${TASK_ID}..."
-              for i in $(seq 1 30); do
-                sleep 5
-                TASK=$($CURL "${OS}/_plugins/_ml/tasks/${TASK_ID}")
-                STATE=$(echo "${TASK}" | grep -o '"state":"[^"]*"' | cut -d'"' -f4)
-                echo "  Task state: ${STATE}"
-                if [ "${STATE}" = "COMPLETED" ]; then break; fi
-                if [ "${STATE}" = "FAILED" ]; then echo "Task failed!"; echo "${TASK}"; exit 1; fi
-              done
-              MODEL_ID=$(echo "${TASK}" | grep -o '"model_id":"[^"]*"' | cut -d'"' -f4)
-              echo "Model ID: ${MODEL_ID}"
-
-              # Deploy the model
-              echo "=== Deploying model..."
-              $CURL -X POST "${OS}/_plugins/_ml/models/${MODEL_ID}/_deploy" \
-                -H "Content-Type: application/json"
-              sleep 10
-
-              # ─────────────────────────────────────────────────
-              # 5. Create ingest pipeline with neural processor
-              # ─────────────────────────────────────────────────
-              echo ""
-              echo "=== Creating neural ingest pipeline..."
-              $CURL -X PUT "${OS}/_ingest/pipeline/rag-embedding-pipeline" \
-                -H "Content-Type: application/json" -d "{
-                  \"description\": \"Generate embeddings for RAG using Ollama nomic-embed-text\",
-                  \"processors\": [{
-                    \"text_embedding\": {
-                      \"model_id\": \"${MODEL_ID}\",
-                      \"field_map\": {
-                        \"text_chunk\": \"embedding\"
-                      }
-                    }
-                  }]
-                }"
-
-              # ─────────────────────────────────────────────────
-              # 6. Create kNN index for RAG
-              # ─────────────────────────────────────────────────
-              echo ""
-              echo "=== Creating rag-logs kNN index..."
-              $CURL -X PUT "${OS}/rag-logs" \
-                -H "Content-Type: application/json" -d '{
-                  "settings": {
-                    "index": {
-                      "knn": true,
-                      "knn.algo_param.ef_search": 100
-                    },
-                    "default_pipeline": "rag-embedding-pipeline",
-                    "number_of_shards": 1,
-                    "number_of_replicas": 0
-                  },
-                  "mappings": {
-                    "properties": {
-                      "text_chunk":  { "type": "text" },
-                      "embedding": {
-                        "type": "knn_vector",
-                        "dimension": 768,
-                        "method": {
-                          "name": "hnsw",
-                          "space_type": "l2",
-                          "engine": "lucene"
-                        }
+              if not connector_id:
+                  print("=== Creating ML connector to Ollama...")
+                  resp = os_req("POST", "/_plugins/_ml/connectors/_create", {
+                      "name": CONNECTOR_NAME,
+                      "description": "Connector to Ollama nomic-embed-text for embeddings",
+                      "version": "1",
+                      "protocol": "http",
+                      "parameters": {
+                          "model": "nomic-embed-text",
+                          "endpoint": OLLAMA
                       },
-                      "timestamp":   { "type": "date" },
-                      "pod":         { "type": "keyword" },
-                      "namespace":   { "type": "keyword" },
-                      "container":   { "type": "keyword" },
-                      "log_level":   { "type": "keyword" },
-                      "source_index":{ "type": "keyword" }
-                    }
-                  }
-                }'
+                      "actions": [{
+                          "action_type": "predict",
+                          "method": "POST",
+                          "url": f"{OLLAMA}/api/embeddings",
+                          "headers": {"Content-Type": "application/json"},
+                          "request_body": "{\"model\": \"${parameters.model}\", \"prompt\": \"${parameters.input}\"}",
+                          "pre_process_function": "connector.pre_process.default.embedding",
+                          "post_process_function": "connector.post_process.default.embedding"
+                      }]
+                  })
+                  connector_id = resp.get("connector_id")
+                  if not connector_id:
+                      sys.exit(f"Failed to create connector: {resp}")
+                  print(f"=== Created connector: {connector_id}")
 
-              # Store model_id in a ConfigMap for use by the reindex job
-              echo ""
-              echo "=== Saving model_id for reindex job..."
-              cat > /tmp/model_id.txt <<EOF
-              ${MODEL_ID}
-              EOF
+              # ─────────────────────────────────────────────────
+              # 4. Register + deploy model (idempotent by name search)
+              # ─────────────────────────────────────────────────
+              MODEL_NAME = "nomic-embed-text"
+              model_id = None
 
-              echo ""
-              echo "=== RAG setup complete!"
-              echo "    Connector ID: ${CONNECTOR_ID}"
-              echo "    Model ID:     ${MODEL_ID}"
-              echo "    Index:        rag-logs (kNN, 768 dims)"
-              echo "    Pipeline:     rag-embedding-pipeline"
-              echo ""
-              echo "Run the opensearch-reindex-rag job to populate rag-logs from otel-logs-*"
+              search_resp = os_req("POST", "/_plugins/_ml/models/_search", {
+                  "query": {"match": {"name": MODEL_NAME}}
+              })
+              for hit in search_resp.get("hits", {}).get("hits", []):
+                  src = hit.get("_source", {})
+                  if src.get("name") == MODEL_NAME and src.get("connector_id") == connector_id:
+                      model_id = hit["_id"]
+                      print(f"=== Reusing existing model: {model_id}")
+                      break
+
+              if not model_id:
+                  print("=== Registering embedding model...")
+                  resp = os_req("POST", "/_plugins/_ml/models/_register", {
+                      "name": MODEL_NAME,
+                      "version": "1",
+                      "function_name": "remote",
+                      "description": "Ollama nomic-embed-text embeddings (768 dimensions)",
+                      "connector_id": connector_id
+                  })
+                  print(f"    Register response: {resp}")
+                  task_id = resp.get("task_id")
+                  if not task_id:
+                      sys.exit(f"Register returned no task_id: {resp}")
+
+                  print(f"    Waiting for task {task_id}...")
+                  for _ in range(30):
+                      time.sleep(5)
+                      task = os_req("GET", f"/_plugins/_ml/tasks/{task_id}")
+                      state = task.get("state", "")
+                      print(f"      state: {state}")
+                      if state == "COMPLETED":
+                          model_id = task.get("model_id")
+                          break
+                      if state == "FAILED":
+                          sys.exit(f"Model registration task failed: {task}")
+                  if not model_id:
+                      sys.exit("Model registration did not complete in time")
+                  print(f"=== Registered model: {model_id}")
+
+                  print("=== Deploying model...")
+                  os_req("POST", f"/_plugins/_ml/models/{model_id}/_deploy")
+                  time.sleep(10)
+
+              # ─────────────────────────────────────────────────
+              # 5. Create ingest pipeline (idempotent)
+              # ─────────────────────────────────────────────────
+              print("=== Creating neural ingest pipeline...")
+              os_req("PUT", "/_ingest/pipeline/rag-embedding-pipeline", {
+                  "description": "Generate embeddings for RAG using Ollama nomic-embed-text",
+                  "processors": [{
+                      "text_embedding": {
+                          "model_id": model_id,
+                          "field_map": {"text_chunk": "embedding"}
+                      }
+                  }]
+              })
+
+              # ─────────────────────────────────────────────────
+              # 6. Create kNN index (idempotent — skip if exists)
+              # ─────────────────────────────────────────────────
+              exists = os_req("HEAD", "/rag-logs")
+              if exists.get("status", 0) != 404 and not isinstance(exists, dict):
+                  print("=== rag-logs index already exists, skipping creation.")
+              else:
+                  idx_check = os_req("GET", "/rag-logs")
+                  if "rag-logs" in idx_check:
+                      print("=== rag-logs index already exists, skipping creation.")
+                  else:
+                      print("=== Creating rag-logs kNN index...")
+                      os_req("PUT", "/rag-logs", {
+                          "settings": {
+                              "index": {
+                                  "knn": True,
+                                  "knn.algo_param.ef_search": 100
+                              },
+                              "default_pipeline": "rag-embedding-pipeline",
+                              "number_of_shards": 1,
+                              "number_of_replicas": 0
+                          },
+                          "mappings": {
+                              "properties": {
+                                  "text_chunk":   {"type": "text"},
+                                  "embedding": {
+                                      "type": "knn_vector",
+                                      "dimension": 768,
+                                      "method": {
+                                          "name": "hnsw",
+                                          "space_type": "l2",
+                                          "engine": "lucene"
+                                      }
+                                  },
+                                  "timestamp":    {"type": "date"},
+                                  "pod":          {"type": "keyword"},
+                                  "namespace":    {"type": "keyword"},
+                                  "container":    {"type": "keyword"},
+                                  "log_level":    {"type": "keyword"},
+                                  "source_index": {"type": "keyword"}
+                              }
+                          }
+                      })
+
+              print("")
+              print("=== RAG setup complete!")
+              print(f"    Connector ID: {connector_id}")
+              print(f"    Model ID:     {model_id}")
+              print( "    Index:        rag-logs (kNN, 768 dims)")
+              print( "    Pipeline:     rag-embedding-pipeline")
+              print( "")
+              print( "Run the opensearch-reindex-rag job to populate rag-logs from otel-logs-*")
           volumeMounts:
             - name: credentials
               mountPath: /credentials
