@@ -16,74 +16,146 @@ spec:
       restartPolicy: OnFailure
       containers:
         - name: reindex
-          image: curlimages/curl:8.7.1
+          image: python:3.11-alpine
           command:
-            - /bin/sh
+            - python3
             - -c
             - |
-              OS="https://opensearch.opensearch.svc.cluster.local:9200"
-              USER=$(cat /credentials/username)
-              PASS=$(cat /credentials/password)
-              CURL="curl -sk -u ${USER}:${PASS}"
+              import urllib.request, urllib.error, json, time, ssl, base64, sys
+              from urllib.request import Request
 
-              echo "=== Waiting for rag-logs index to exist..."
-              until $CURL "${OS}/rag-logs" -o /dev/null; do sleep 10; done
+              OS = "https://opensearch.opensearch.svc.cluster.local:9200"
+              with open("/credentials/username") as f: USER = f.read().strip()
+              with open("/credentials/password") as f: PASS = f.read().strip()
 
-              # Compute timestamps for last 7 days
-              NOW=$(date -u +%s)
-              SINCE=$(( NOW - 7 * 86400 ))
-              SINCE_MS=$(( SINCE * 1000 ))
+              ssl_ctx = ssl.create_default_context()
+              ssl_ctx.check_hostname = False
+              ssl_ctx.verify_mode = ssl.CERT_NONE
 
-              echo "=== Reindexing otel-logs-* → rag-logs (since ${SINCE_MS} ms epoch)..."
-              $CURL -X POST "${OS}/_reindex?wait_for_completion=false&requests_per_second=100" \
-                -H "Content-Type: application/json" -d "{
-                  \"conflicts\": \"proceed\",
-                  \"source\": {
-                    \"index\": \"otel-logs-*\",
-                    \"query\": {
-                      \"range\": {
-                        \"@timestamp\": {\"gte\": ${SINCE_MS}}
-                      }
-                    },
-                    \"_source\": [\"@timestamp\", \"log.body\", \"resource.attributes.k8s.pod.name\",
-                                  \"resource.attributes.k8s.namespace.name\",
-                                  \"resource.attributes.k8s.container.name\",
-                                  \"severity\"]
+              def os_req(method, path, data=None):
+                  creds = base64.b64encode(f"{USER}:{PASS}".encode()).decode()
+                  h = {"Authorization": f"Basic {creds}"}
+                  raw = None
+                  if data is not None:
+                      raw = json.dumps(data).encode()
+                      h["Content-Type"] = "application/json"
+                  req = Request(f"{OS}{path}", data=raw, headers=h, method=method)
+                  try:
+                      with urllib.request.urlopen(req, context=ssl_ctx, timeout=120) as r:
+                          return json.loads(r.read())
+                  except urllib.error.HTTPError as e:
+                      body = e.read().decode(errors="replace")
+                      print(f"  HTTP {e.code} {method} {path}: {body[:400]}")
+                      return {}
+                  except Exception as e:
+                      print(f"  ERROR {method} {path}: {e}")
+                      return {}
+
+              # ─────────────────────────────────────────────────
+              # 0. Wait for rag-logs index
+              # ─────────────────────────────────────────────────
+              print("=== Waiting for rag-logs index...")
+              for _ in range(60):
+                  r = os_req("GET", "/rag-logs")
+                  if "rag-logs" in r:
+                      break
+                  time.sleep(10)
+              else:
+                  sys.exit("rag-logs index not found after 10 min")
+
+              # ─────────────────────────────────────────────────
+              # 1. Sample a document to detect actual field layout
+              # ─────────────────────────────────────────────────
+              print("=== Sampling otel-logs-* to detect field layout...")
+              sample = os_req("POST", "/otel-logs-*/_search", {"size": 1})
+              hits = sample.get("hits", {}).get("hits", [])
+              if not hits:
+                  sys.exit("No documents found in otel-logs-* — pipeline not writing logs yet")
+              doc = hits[0].get("_source", {})
+              print(f"    Sample doc keys: {list(doc.keys())}")
+              # Detect body field: data-prepper uses top-level 'body', not 'log.body'
+              body_field  = "body" if "body" in doc else ("log" if "log" in doc else "body")
+              # Detect severity field
+              sev_field   = "severityText" if "severityText" in doc else ("severity" if "severity" in doc else "severityText")
+              # Detect resource pod field path
+              use_resource_obj = ("resource" in doc and isinstance(doc["resource"], dict)
+                                  and "attributes" in doc["resource"])
+              print(f"    body_field={body_field}, sev_field={sev_field}, resource_obj={use_resource_obj}")
+
+              # ─────────────────────────────────────────────────
+              # 2. Count source docs (last 7 days)
+              # ─────────────────────────────────────────────────
+              import time as _time
+              SINCE_MS = int(_time.time() * 1000) - 7 * 86400 * 1000
+              count_resp = os_req("POST", "/otel-logs-*/_count", {
+                  "query": {"range": {"@timestamp": {"gte": SINCE_MS}}}
+              })
+              src_count = count_resp.get("count", 0)
+              print(f"    Source docs (last 7d): {src_count}")
+              if src_count == 0:
+                  print("  WARNING: No docs in otel-logs-* for last 7 days — trying without time filter")
+                  SINCE_MS = 0
+
+              # Build Painless script based on detected layout
+              if body_field == "log":
+                  body_expr = "ctx.containsKey('log') && ctx['log'] instanceof Map && ctx['log'].containsKey('body') ? ctx['log']['body'].toString() : ''"
+              else:
+                  body_expr = "ctx.containsKey('body') ? ctx['body'].toString() : ''"
+
+              if use_resource_obj:
+                  pod_expr = "ctx.containsKey('resource') && ctx['resource'] instanceof Map && ctx['resource'].containsKey('attributes') && ctx['resource']['attributes'] instanceof Map ? (ctx['resource']['attributes'].containsKey('k8s.pod.name') ? ctx['resource']['attributes']['k8s.pod.name'].toString() : '') : ''"
+                  ns_expr  = "ctx.containsKey('resource') && ctx['resource'] instanceof Map && ctx['resource'].containsKey('attributes') && ctx['resource']['attributes'] instanceof Map ? (ctx['resource']['attributes'].containsKey('k8s.namespace.name') ? ctx['resource']['attributes']['k8s.namespace.name'].toString() : '') : ''"
+                  ctr_expr = "ctx.containsKey('resource') && ctx['resource'] instanceof Map && ctx['resource'].containsKey('attributes') && ctx['resource']['attributes'] instanceof Map ? (ctx['resource']['attributes'].containsKey('k8s.container.name') ? ctx['resource']['attributes']['k8s.container.name'].toString() : '') : ''"
+              else:
+                  # flattened: resource.attributes.k8s.pod.name stored as dotted key
+                  pod_expr = "ctx.containsKey('resource.attributes.k8s.pod.name') ? ctx['resource.attributes.k8s.pod.name'].toString() : ''"
+                  ns_expr  = "ctx.containsKey('resource.attributes.k8s.namespace.name') ? ctx['resource.attributes.k8s.namespace.name'].toString() : ''"
+                  ctr_expr = "ctx.containsKey('resource.attributes.k8s.container.name') ? ctx['resource.attributes.k8s.container.name'].toString() : ''"
+
+              sev_expr = f"ctx.containsKey('{sev_field}') ? ctx['{sev_field}'].toString() : 'UNKNOWN'"
+
+              painless = (
+                  f"String body = {body_expr}; "
+                  f"String pod = {pod_expr}; "
+                  f"String ns = {ns_expr}; "
+                  f"String ctr = {ctr_expr}; "
+                  f"String sev = {sev_expr}; "
+                  "ctx.text_chunk = '[' + ns + '/' + pod + '/' + ctr + '] ' + body; "
+                  "ctx.timestamp = ctx['@timestamp']; "
+                  "ctx.pod = pod; ctx.namespace = ns; ctx.container = ctr; "
+                  "ctx.log_level = sev; ctx.source_index = ctx['_index']; "
+                  "ctx.remove('@timestamp'); "
+              )
+
+              # ─────────────────────────────────────────────────
+              # 3. Synchronous reindex (wait_for_completion=true)
+              # ─────────────────────────────────────────────────
+              query = {"range": {"@timestamp": {"gte": SINCE_MS}}} if SINCE_MS > 0 else {"match_all": {}}
+              print("=== Starting reindex otel-logs-* → rag-logs (synchronous)...")
+              result = os_req("POST", "/_reindex?requests_per_second=50", {
+                  "conflicts": "proceed",
+                  "source": {
+                      "index": "otel-logs-*",
+                      "size": 100,
+                      "query": query
                   },
-                  \"dest\": {
-                    \"index\": \"rag-logs\",
-                    \"pipeline\": \"rag-embedding-pipeline\"
+                  "dest": {
+                      "index": "rag-logs",
+                      "pipeline": "rag-embedding-pipeline"
                   },
-                  \"script\": {
-                    \"lang\": \"painless\",
-                    \"source\": \"
-                      String body = ctx.containsKey('log') && ctx['log'].containsKey('body') ? ctx['log']['body'].toString() : '';
-                      String pod   = ctx.containsKey('resource') && ctx['resource'].containsKey('attributes') ? ctx['resource']['attributes'].getOrDefault('k8s.pod.name', '') : '';
-                      String ns    = ctx.containsKey('resource') && ctx['resource'].containsKey('attributes') ? ctx['resource']['attributes'].getOrDefault('k8s.namespace.name', '') : '';
-                      String ctr   = ctx.containsKey('resource') && ctx['resource'].containsKey('attributes') ? ctx['resource']['attributes'].getOrDefault('k8s.container.name', '') : '';
-                      ctx.text_chunk     = '[' + ns + '/' + pod + '/' + ctr + '] ' + body;
-                      ctx.timestamp      = ctx['@timestamp'];
-                      ctx.pod            = pod;
-                      ctx.namespace      = ns;
-                      ctx.container      = ctr;
-                      ctx.log_level      = ctx.containsKey('severity') ? ctx['severity'] : 'UNKNOWN';
-                      ctx.source_index   = ctx['_index'];
-                      ctx.remove('@timestamp');
-                      ctx.remove('log');
-                      ctx.remove('resource');
-                      ctx.remove('severity');
-                    \"
-                  }
-                }" | python3 -m json.tool 2>/dev/null || true
+                  "script": {"lang": "painless", "source": painless}
+              })
+              print(f"    Reindex result: total={result.get('total',0)}, created={result.get('created',0)}, "
+                    f"updated={result.get('updated',0)}, failures={len(result.get('failures',[]))}")
+              if result.get("failures"):
+                  for f in result["failures"][:5]:
+                      print(f"    Failure: {f}")
 
-              echo ""
-              echo "=== Reindex submitted asynchronously."
-              echo "    Monitor: $CURL '${OS}/_tasks?actions=*reindex&detailed'"
-
-              # Check doc count after a delay
-              sleep 30
-              COUNT=$($CURL "${OS}/rag-logs/_count" | grep -o '"count":[0-9]*' | cut -d: -f2)
-              echo "    rag-logs current doc count: ${COUNT}"
+              count = os_req("GET", "/rag-logs/_count").get("count", 0)
+              print(f"=== rag-logs doc count: {count}")
+              if count == 0:
+                  sys.exit("Reindex produced 0 documents — check failures above")
+              print("=== Reindex complete.")
           volumeMounts:
             - name: credentials
               mountPath: /credentials
@@ -116,63 +188,94 @@ spec:
           restartPolicy: OnFailure
           containers:
             - name: reindex
-              image: curlimages/curl:8.7.1
+              image: python:3.11-alpine
               command:
-                - /bin/sh
+                - python3
                 - -c
                 - |
-                  OS="https://opensearch.opensearch.svc.cluster.local:9200"
-                  USER=$(cat /credentials/username)
-                  PASS=$(cat /credentials/password)
-                  CURL="curl -sk -u ${USER}:${PASS}"
+                  import urllib.request, urllib.error, json, time, ssl, base64, sys
+                  from urllib.request import Request
 
-                  # Last 2h window to catch any backlog
-                  NOW=$(date -u +%s)
-                  SINCE_MS=$(( (NOW - 7200) * 1000 ))
+                  OS = "https://opensearch.opensearch.svc.cluster.local:9200"
+                  with open("/credentials/username") as f: USER = f.read().strip()
+                  with open("/credentials/password") as f: PASS = f.read().strip()
 
-                  echo "=== Incremental reindex otel-logs-* → rag-logs (last 2h)..."
-                  $CURL -X POST "${OS}/_reindex?requests_per_second=50" \
-                    -H "Content-Type: application/json" -d "{
-                      \"conflicts\": \"proceed\",
-                      \"source\": {
-                        \"index\": \"otel-logs-*\",
-                        \"query\": {
-                          \"range\": {
-                            \"@timestamp\": {\"gte\": ${SINCE_MS}}
-                          }
-                        },
-                        \"_source\": [\"@timestamp\", \"log.body\",
-                                      \"resource.attributes.k8s.pod.name\",
-                                      \"resource.attributes.k8s.namespace.name\",
-                                      \"resource.attributes.k8s.container.name\",
-                                      \"severity\"]
+                  ssl_ctx = ssl.create_default_context()
+                  ssl_ctx.check_hostname = False
+                  ssl_ctx.verify_mode = ssl.CERT_NONE
+
+                  def os_req(method, path, data=None):
+                      creds = base64.b64encode(f"{USER}:{PASS}".encode()).decode()
+                      h = {"Authorization": f"Basic {creds}"}
+                      raw = None
+                      if data is not None:
+                          raw = json.dumps(data).encode()
+                          h["Content-Type"] = "application/json"
+                      req = Request(f"{OS}{path}", data=raw, headers=h, method=method)
+                      try:
+                          with urllib.request.urlopen(req, context=ssl_ctx, timeout=120) as r:
+                              return json.loads(r.read())
+                      except urllib.error.HTTPError as e:
+                          body = e.read().decode(errors="replace")
+                          print(f"  HTTP {e.code} {method} {path}: {body[:300]}")
+                          return {}
+                      except Exception as e:
+                          print(f"  ERROR {method} {path}: {e}")
+                          return {}
+
+                  SINCE_MS = int(time.time() * 1000) - 7200 * 1000
+
+                  # Detect field layout from a sample doc
+                  sample = os_req("POST", "/otel-logs-*/_search", {"size": 1})
+                  hits = sample.get("hits", {}).get("hits", [])
+                  if not hits:
+                      print("No docs in otel-logs-*, skipping."); sys.exit(0)
+                  doc = hits[0].get("_source", {})
+                  body_field = "body" if "body" in doc else "log"
+                  sev_field  = "severityText" if "severityText" in doc else "severity"
+                  use_resource_obj = ("resource" in doc and isinstance(doc["resource"], dict)
+                                      and "attributes" in doc["resource"])
+
+                  if body_field == "log":
+                      body_expr = "ctx.containsKey('log') && ctx['log'] instanceof Map && ctx['log'].containsKey('body') ? ctx['log']['body'].toString() : ''"
+                  else:
+                      body_expr = "ctx.containsKey('body') ? ctx['body'].toString() : ''"
+                  if use_resource_obj:
+                      pod_expr = "ctx.containsKey('resource') && ctx['resource'] instanceof Map && ctx['resource'].containsKey('attributes') && ctx['resource']['attributes'] instanceof Map ? (ctx['resource']['attributes'].containsKey('k8s.pod.name') ? ctx['resource']['attributes']['k8s.pod.name'].toString() : '') : ''"
+                      ns_expr  = "ctx.containsKey('resource') && ctx['resource'] instanceof Map && ctx['resource'].containsKey('attributes') && ctx['resource']['attributes'] instanceof Map ? (ctx['resource']['attributes'].containsKey('k8s.namespace.name') ? ctx['resource']['attributes']['k8s.namespace.name'].toString() : '') : ''"
+                      ctr_expr = "ctx.containsKey('resource') && ctx['resource'] instanceof Map && ctx['resource'].containsKey('attributes') && ctx['resource']['attributes'] instanceof Map ? (ctx['resource']['attributes'].containsKey('k8s.container.name') ? ctx['resource']['attributes']['k8s.container.name'].toString() : '') : ''"
+                  else:
+                      pod_expr = "ctx.containsKey('resource.attributes.k8s.pod.name') ? ctx['resource.attributes.k8s.pod.name'].toString() : ''"
+                      ns_expr  = "ctx.containsKey('resource.attributes.k8s.namespace.name') ? ctx['resource.attributes.k8s.namespace.name'].toString() : ''"
+                      ctr_expr = "ctx.containsKey('resource.attributes.k8s.container.name') ? ctx['resource.attributes.k8s.container.name'].toString() : ''"
+                  sev_expr = f"ctx.containsKey('{sev_field}') ? ctx['{sev_field}'].toString() : 'UNKNOWN'"
+
+                  painless = (
+                      f"String body = {body_expr}; "
+                      f"String pod = {pod_expr}; "
+                      f"String ns = {ns_expr}; "
+                      f"String ctr = {ctr_expr}; "
+                      f"String sev = {sev_expr}; "
+                      "ctx.text_chunk = '[' + ns + '/' + pod + '/' + ctr + '] ' + body; "
+                      "ctx.timestamp = ctx['@timestamp']; "
+                      "ctx.pod = pod; ctx.namespace = ns; ctx.container = ctr; "
+                      "ctx.log_level = sev; ctx.source_index = ctx['_index']; "
+                      "ctx.remove('@timestamp'); "
+                  )
+
+                  print("=== Incremental reindex otel-logs-* → rag-logs (last 2h)...")
+                  result = os_req("POST", "/_reindex?requests_per_second=50", {
+                      "conflicts": "proceed",
+                      "source": {
+                          "index": "otel-logs-*",
+                          "size": 100,
+                          "query": {"range": {"@timestamp": {"gte": SINCE_MS}}}
                       },
-                      \"dest\": {
-                        \"index\": \"rag-logs\",
-                        \"pipeline\": \"rag-embedding-pipeline\"
-                      },
-                      \"script\": {
-                        \"lang\": \"painless\",
-                        \"source\": \"
-                          String body = ctx.containsKey('log') && ctx['log'].containsKey('body') ? ctx['log']['body'].toString() : '';
-                          String pod   = ctx.containsKey('resource') && ctx['resource'].containsKey('attributes') ? ctx['resource']['attributes'].getOrDefault('k8s.pod.name', '') : '';
-                          String ns    = ctx.containsKey('resource') && ctx['resource'].containsKey('attributes') ? ctx['resource']['attributes'].getOrDefault('k8s.namespace.name', '') : '';
-                          String ctr   = ctx.containsKey('resource') && ctx['resource'].containsKey('attributes') ? ctx['resource']['attributes'].getOrDefault('k8s.container.name', '') : '';
-                          ctx.text_chunk   = '[' + ns + '/' + pod + '/' + ctr + '] ' + body;
-                          ctx.timestamp    = ctx['@timestamp'];
-                          ctx.pod          = pod;
-                          ctx.namespace    = ns;
-                          ctx.container    = ctr;
-                          ctx.log_level    = ctx.containsKey('severity') ? ctx['severity'] : 'UNKNOWN';
-                          ctx.source_index = ctx['_index'];
-                          ctx.remove('@timestamp');
-                          ctx.remove('log');
-                          ctx.remove('resource');
-                          ctx.remove('severity');
-                        \"
-                      }
-                    }" -o /dev/null
-                  echo "Done."
+                      "dest": {"index": "rag-logs", "pipeline": "rag-embedding-pipeline"},
+                      "script": {"lang": "painless", "source": painless}
+                  })
+                  print(f"    created={result.get('created',0)} updated={result.get('updated',0)} failures={len(result.get('failures',[]))}")
+                  print("Done.")
               volumeMounts:
                 - name: credentials
                   mountPath: /credentials
