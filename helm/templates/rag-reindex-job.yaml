@@ -133,13 +133,13 @@ spec:
               )
 
               # ─────────────────────────────────────────────────
-              # 3. Synchronous reindex — bypass default pipeline
+              # 3. Async reindex + task poll — bypass default pipeline
               #    (rag-embedding-pipeline needs ingest node / ML node;
               #     webui-setup-job only needs text_chunk, not vectors)
               # ─────────────────────────────────────────────────
               query = {"range": {ts_field: {"gte": SINCE_MS}}} if SINCE_MS > 0 else {"match_all": {}}
-              print("=== Starting reindex otel-logs-* → rag-logs (synchronous, no pipeline)...")
-              result = os_req("POST", "/_reindex?requests_per_second=50", {
+              print("=== Submitting reindex otel-logs-* → rag-logs (async, no pipeline)...")
+              resp = os_req("POST", "/_reindex?wait_for_completion=false&requests_per_second=50", {
                   "conflicts": "proceed",
                   "source": {
                       "index": "otel-logs-*",
@@ -148,20 +148,33 @@ spec:
                   },
                   "dest": {
                       "index": "rag-logs",
-                      "pipeline": "_none"   # bypass default_pipeline to avoid ingest node requirement
+                      "pipeline": "_none"   # bypass default_pipeline — no ingest node needed
                   },
                   "script": {"lang": "painless", "source": painless}
               })
-              print(f"    Reindex result: total={result.get('total',0)}, created={result.get('created',0)}, "
-                    f"updated={result.get('updated',0)}, failures={len(result.get('failures',[]))}")
-              if result.get("failures"):
-                  for f in result["failures"][:5]:
-                      print(f"    Failure: {f}")
+              task_id = resp.get("task")
+              if not task_id:
+                  sys.exit(f"Reindex did not return a task id: {resp}")
+              print(f"    Task ID: {task_id}")
+
+              # Poll task until complete (up to 60 min)
+              for i in range(360):
+                  time.sleep(10)
+                  t = os_req("GET", f"/_tasks/{task_id}")
+                  completed = t.get("completed", False)
+                  status = t.get("task", {}).get("status", {})
+                  created = status.get("created", 0)
+                  total   = status.get("total", 0)
+                  print(f"    [{i+1}] completed={completed} total={total} created={created}")
+                  if completed:
+                      break
+              else:
+                  print("  WARNING: Task did not complete in 60 min, proceeding with whatever was indexed")
 
               count = os_req("GET", "/rag-logs/_count").get("count", 0)
               print(f"=== rag-logs doc count: {count}")
               if count == 0:
-                  sys.exit("Reindex produced 0 documents — check failures above")
+                  sys.exit("Reindex produced 0 documents — check task failures")
               print("=== Reindex complete.")
           volumeMounts:
             - name: credentials
