@@ -203,6 +203,7 @@ spec:
   failedJobsHistoryLimit: 2
   jobTemplate:
     spec:
+      ttlSecondsAfterFinished: 300
       template:
         spec:
           restartPolicy: OnFailure
