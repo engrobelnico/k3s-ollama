@@ -1,0 +1,236 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: anythingllm-setup
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: setup
+          image: python:3.11-alpine
+          command:
+            - python3
+            - -c
+            - |
+              import urllib.request, urllib.error, json, time, os, ssl, base64, sys
+              from urllib.request import Request
+              from datetime import datetime, timedelta, timezone
+
+              ALLM  = "http://anythingllm.ollama.svc.cluster.local:3001"
+              OS    = "https://opensearch.opensearch.svc.cluster.local:9200"
+
+              with open("/allm-auth/token")   as f: TOKEN   = f.read().strip()
+              with open("/os-creds/username") as f: OS_USER = f.read().strip()
+              with open("/os-creds/password") as f: OS_PASS = f.read().strip()
+
+              ssl_ctx = ssl.create_default_context()
+              ssl_ctx.check_hostname = False
+              ssl_ctx.verify_mode = ssl.CERT_NONE
+
+              # ─────────────────────────────────────────────────
+              # Helpers
+              # ─────────────────────────────────────────────────
+              def allm(method, path, data=None, raw_data=None, content_type=None, timeout=60):
+                  h = {"Authorization": f"Bearer {TOKEN}"}
+                  if data is not None:
+                      raw_data = json.dumps(data).encode()
+                      h["Content-Type"] = "application/json"
+                  elif content_type:
+                      h["Content-Type"] = content_type
+                  h["Accept"] = "application/json"
+                  req = Request(f"{ALLM}{path}", data=raw_data, headers=h, method=method)
+                  try:
+                      with urllib.request.urlopen(req, timeout=timeout) as r:
+                          body = r.read()
+                          return json.loads(body) if body else {}
+                  except urllib.error.HTTPError as e:
+                      body = e.read().decode(errors="replace")
+                      print(f"  HTTP {e.code} {method} {path}: {body[:300]}")
+                      return {}
+                  except Exception as e:
+                      print(f"  ERROR {method} {path}: {e}")
+                      return {}
+
+              def os_req(method, path, data=None):
+                  creds = base64.b64encode(f"{OS_USER}:{OS_PASS}".encode()).decode()
+                  h = {"Authorization": f"Basic {creds}"}
+                  raw = None
+                  if data is not None:
+                      raw = json.dumps(data).encode()
+                      h["Content-Type"] = "application/json"
+                  req = Request(f"{OS}{path}", data=raw, headers=h, method=method)
+                  try:
+                      with urllib.request.urlopen(req, context=ssl_ctx, timeout=60) as r:
+                          return json.loads(r.read())
+                  except urllib.error.HTTPError as e:
+                      body = e.read().decode(errors="replace")
+                      print(f"  HTTP {e.code} {method} {path}: {body[:300]}")
+                      return {}
+                  except Exception as e:
+                      print(f"  ERROR {method} {path}: {e}")
+                      return {}
+
+              # ─────────────────────────────────────────────────
+              # 0. Wait for AnythingLLM
+              # ─────────────────────────────────────────────────
+              print("=== Waiting for AnythingLLM...")
+              for _ in range(60):
+                  try:
+                      urllib.request.urlopen(f"{ALLM}/api/ping", timeout=5)
+                      break
+                  except Exception:
+                      time.sleep(5)
+              else:
+                  sys.exit("AnythingLLM not ready after 5 min")
+              print("=== AnythingLLM ready")
+
+              # ─────────────────────────────────────────────────
+              # 1. Verify auth
+              # ─────────────────────────────────────────────────
+              auth_resp = allm("GET", "/api/auth")
+              if not auth_resp.get("authenticated"):
+                  sys.exit(f"AnythingLLM auth failed: {auth_resp}")
+              print("=== Authenticated")
+
+              # ─────────────────────────────────────────────────
+              # 2. Create workspace "log-analysis" if not exists
+              # ─────────────────────────────────────────────────
+              ws_resp = allm("GET", "/api/v0/workspaces")
+              workspaces = ws_resp.get("workspaces", [])
+              slug = next((w["slug"] for w in workspaces if w.get("name") == "log-analysis"), None)
+              if slug:
+                  print(f"=== Workspace 'log-analysis' already exists (slug: {slug})")
+              else:
+                  new_ws = allm("POST", "/api/v0/workspace/new", {"name": "log-analysis"})
+                  slug = new_ws.get("workspace", {}).get("slug")
+                  if not slug:
+                      sys.exit(f"Failed to create workspace: {new_ws}")
+                  print(f"=== Created workspace 'log-analysis' (slug: {slug})")
+
+              # ─────────────────────────────────────────────────
+              # 3. Fetch last 7 days of logs from otel-logs-*
+              # ─────────────────────────────────────────────────
+              print("=== Fetching logs from OpenSearch otel-logs-*...")
+              # Check source index exists
+              indices = os_req("GET", "/_cat/indices/otel-logs-*?format=json")
+              if not indices:
+                  print("  WARNING: No otel-logs-* indices found — skipping document upload")
+                  sys.exit(0)
+
+              # Get a sample doc to detect field layout
+              sample = os_req("POST", "/otel-logs-*/_search", {"size": 1})
+              hits_sample = sample.get("hits", {}).get("hits", [])
+              if not hits_sample:
+                  print("  WARNING: otel-logs-* is empty — skipping document upload")
+                  sys.exit(0)
+              doc = hits_sample[0].get("_source", {})
+              body_field = "body" if "body" in doc else "log"
+              sev_field  = "severityText" if "severityText" in doc else "severity"
+              ts_field   = "time" if "time" in doc else ("observedTime" if "observedTime" in doc else "@timestamp")
+              pod_key = next((k for k in doc if "pod" in k and "uid" not in k and "restart" not in k
+                              and k.startswith("resource")), None)
+              ns_key  = next((k for k in doc if "namespace" in k and k.startswith("resource")), None)
+              print(f"    Fields detected: body={body_field}, ts={ts_field}, pod={pod_key}, ns={ns_key}")
+
+              # Fetch last 7 days (max 2000 docs)
+              SINCE_ISO = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+              result = os_req("POST", "/otel-logs-*/_search", {
+                  "size": 2000,
+                  "sort": [{ts_field: {"order": "desc"}}],
+                  "query": {"range": {ts_field: {"gte": SINCE_ISO}}},
+                  "_source": [body_field, sev_field, ts_field] + (
+                      [pod_key] if pod_key else []) + ([ns_key] if ns_key else [])
+              })
+              hits = result.get("hits", {}).get("hits", [])
+              print(f"    Got {len(hits)} log docs from otel-logs-* (last 7d)")
+
+              if not hits:
+                  print("  WARNING: No docs in last 7 days — skipping upload")
+                  sys.exit(0)
+
+              # Build plain-text content (AnythingLLM ingests text natively)
+              lines = []
+              for h in hits:
+                  s = h.get("_source", {})
+                  ts  = s.get(ts_field, "")
+                  sev = s.get(sev_field, "")
+                  pod = s.get(pod_key, "") if pod_key else ""
+                  ns  = s.get(ns_key, "")  if ns_key  else ""
+                  body = s.get(body_field, "")
+                  if isinstance(body, dict):
+                      body = body.get("body", str(body))
+                  lines.append(f"[{ts}] [{sev}] [{ns}/{pod}] {body}")
+              content = "\n".join(lines).encode("utf-8")
+              print(f"    Built {len(lines)} log lines ({len(content)} bytes)")
+
+              # ─────────────────────────────────────────────────
+              # 4. Upload document to AnythingLLM
+              # ─────────────────────────────────────────────────
+              filename = f"otel-logs-init-{datetime.now(timezone.utc).strftime('%Y%m%d')}.txt"
+              boundary = "----AnythingLLMBoundary12345"
+              parts = (
+                  f"--{boundary}\r\n"
+                  f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+                  f"Content-Type: text/plain\r\n\r\n"
+              ).encode() + content + f"\r\n--{boundary}--\r\n".encode()
+
+              print(f"=== Uploading '{filename}' to AnythingLLM document library...")
+              upload_resp = allm(
+                  "POST", "/api/v0/document/upload",
+                  raw_data=parts,
+                  content_type=f"multipart/form-data; boundary={boundary}",
+                  timeout=120
+              )
+              documents = upload_resp.get("documents", [])
+              if not documents:
+                  sys.exit(f"Document upload failed: {upload_resp}")
+              doc_location = documents[0].get("location")
+              print(f"    Document location: {doc_location}")
+
+              # ─────────────────────────────────────────────────
+              # 5. Embed document into workspace
+              # ─────────────────────────────────────────────────
+              print(f"=== Embedding '{doc_location}' into workspace '{slug}'...")
+              embed_resp = allm("POST", f"/api/v0/workspace/{slug}/update-embeddings", {
+                  "adds": [doc_location],
+                  "deletes": []
+              }, timeout=300)
+              print(f"    Embed response: {embed_resp}")
+
+              print("")
+              print("=== AnythingLLM setup complete!")
+              print(f"    Workspace : log-analysis (slug: {slug})")
+              print(f"    Document  : {filename} ({len(lines)} log lines)")
+              print( "    LLM       : llama3.2:3b (via Ollama)")
+              print( "    Embeddings: nomic-embed-text (via Ollama)")
+              print( "    VectorDB  : LanceDB (built-in)")
+              print( "    URL       : http://ollama.kube.local")
+          volumeMounts:
+            - name: allm-auth
+              mountPath: /allm-auth
+              readOnly: true
+            - name: os-creds
+              mountPath: /os-creds
+              readOnly: true
+      volumes:
+        - name: allm-auth
+          secret:
+            secretName: anythingllm-auth
+            items:
+              - key: token
+                path: token
+        - name: os-creds
+          secret:
+            secretName: opensearch-admin-password
+            items:
+              - key: username
+                path: username
+              - key: password
+                path: password

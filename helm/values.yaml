@@ -35,71 +35,23 @@ ollama:
     type: ClusterIP
     port: 11434
 
-open-webui:
+# AnythingLLM configuration
+# AUTH_TOKEN secret is created once by Helm on first install and never overwritten.
+# To change: kubectl patch secret anythingllm-auth -n ollama --type=merge -p '{"data":{"token":"<base64>"}}'
+anythingllm:
+  image:
+    repository: mintplexlabs/anythingllm
+    tag: latest
+    pullPolicy: IfNotPresent
+
+  storage:
+    size: 5Gi
+
   ollama:
-    # Point to the ollama service deployed by this chart
-    enabled: false
-  ollamaUrls:
-    - http://ollama.ollama.svc.cluster.local:11434
-
-  persistence:
-    enabled: true
-    size: 2Gi
-
-  # Base path for Traefik ingress at /ollama
-  extraEnvVars:
-    - name: WEBUI_URL
-      value: "http://ollama.kube.local"
-    # Default chat model — prevents nomic-embed-text from being selected
-    - name: DEFAULT_MODELS
-      value: "llama3.2:3b"
-    # Allow first-user admin signup (used by webui-setup-job)
-    - name: ENABLE_SIGNUP
-      value: "true"
-    # Admin credentials for setup job bootstrap
-    - name: WEBUI_ADMIN_EMAIL
-      valueFrom:
-        secretKeyRef:
-          name: open-webui-admin
-          key: email
-    - name: OPENID_PROVIDER_URL
-      value: ""
-    # OpenSearch RAG configuration
-    - name: RAG_EMBEDDING_ENGINE
-      value: "ollama"
-    - name: RAG_OLLAMA_BASE_URL
-      value: "http://ollama.ollama.svc.cluster.local:11434"
-    - name: RAG_EMBEDDING_MODEL
-      value: "nomic-embed-text"
-    - name: ENABLE_RAG_WEB_SEARCH
-      value: "false"
-    # OpenSearch as vector store
-    - name: VECTOR_DB
-      value: "opensearch"
-    - name: OPENSEARCH_URI
-      value: "https://opensearch.opensearch.svc.cluster.local:9200"
-    - name: OPENSEARCH_SSL_VERIFY
-      value: "false"
-    - name: OPENSEARCH_USERNAME
-      valueFrom:
-        secretKeyRef:
-          name: opensearch-admin-password
-          key: username
-    - name: OPENSEARCH_PASSWORD
-      valueFrom:
-        secretKeyRef:
-          name: opensearch-admin-password
-          key: password
-
-  ingress:
-    enabled: false  # We use our own Ingress template
-
-# Admin credentials for Open WebUI bootstrap (webui-setup-job)
-# The open-webui-admin secret is created once by Helm on first install and never overwritten.
-# To change the password: kubectl patch secret open-webui-admin -n ollama --type='merge' -p '{"data":{"password":"<base64>"}}')
-webui:
-  admin:
-    email: "admin@local.k3s"
+    model: "llama3.2:3b"
+    embeddingModel: "nomic-embed-text"
+    tokenLimit: 4096
+    embeddingMaxChunkLength: 8192
 
   resources:
     requests:

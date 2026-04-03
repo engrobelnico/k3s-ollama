@@ -1,4 +1,4 @@
-# Entry point: /ollama → Open WebUI (prefix stripped by middleware)
+# Entry point: ollama.kube.local → AnythingLLM
 kind: Ingress
 apiVersion: networking.k8s.io/v1
 metadata:
@@ -16,6 +16,6 @@ spec:
             pathType: Prefix
             backend:
               service:
-                name: ollama-open-webui
+                name: anythingllm
                 port:
-                  number: 80
+                  number: 3001
