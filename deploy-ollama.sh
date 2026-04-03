@@ -29,10 +29,11 @@ main () {
     argocd app sync ollama
 
     echo ""
-    echo "Open WebUI available at: http://kube.local/ollama"
+    echo "AnythingLLM available at: http://ollama.kube.local"
     echo ""
     echo "Model pull in progress... check with:"
     echo "  sudo kubectl logs -n ollama deployment/ollama -f"
+    echo "  sudo kubectl logs -n ollama deployment/anythingllm -f"
 }
 
 main "$@"
