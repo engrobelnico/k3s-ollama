@@ -67,9 +67,23 @@ spec:
               value: {{ .Values.anythingllm.ollama.embeddingModel | quote }}
             - name: EMBEDDING_MODEL_MAX_CHUNK_LENGTH
               value: {{ .Values.anythingllm.ollama.embeddingMaxChunkLength | quote }}
-            # Vector DB: LanceDB (built-in, no external dependency)
+            # Vector DB: OpenSearch
             - name: VECTOR_DB
-              value: lancedb
+              value: opensearch
+            - name: OPENSEARCH_ENDPOINT
+              value: "https://opensearch.opensearch.svc.cluster.local:9200"
+            - name: OPENSEARCH_SSL_ENABLED
+              value: "true"
+            - name: OPENSEARCH_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: opensearch-admin-password
+                  key: username
+            - name: OPENSEARCH_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: opensearch-admin-password
+                  key: password
           volumeMounts:
             - name: storage
               mountPath: /app/server/storage
