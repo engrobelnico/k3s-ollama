@@ -50,32 +50,6 @@ ollama:
     type: ClusterIP
     port: 11434
 
-# AnythingLLM configuration
-# AUTH_TOKEN secret is created once by Helm on first install and never overwritten.
-# To change: kubectl patch secret anythingllm-auth -n ollama --type=merge -p '{"data":{"token":"<base64>"}}'
-anythingllm:
-  image:
-    repository: mintplexlabs/anythingllm
-    tag: latest
-    pullPolicy: Always
-
-  storage:
-    size: 5Gi
-
-  ollama:
-    model: "llama3.2:3b"
-    embeddingModel: "nomic-embed-text"
-    tokenLimit: 4096
-    embeddingMaxChunkLength: 8192
-
-  resources:
-    requests:
-      memory: "512Mi"
-      cpu: "200m"
-    limits:
-      memory: "1Gi"
-      cpu: "1000m"
-
 # Flowise — RAG builder with native OpenSearch VectorStore support
 # Access: http://flowise.kube.local (login with auth.username/password)
 # Setup job: creates otel-rag-vectors k-NN index, embeds OTEL logs, wires chatflow

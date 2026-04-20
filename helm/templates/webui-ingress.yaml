@@ -1,25 +1,3 @@
-# Entry point: ollama.kube.local → AnythingLLM
-kind: Ingress
-apiVersion: networking.k8s.io/v1
-metadata:
-  name: ollama-webui
-  namespace: {{ .Release.Namespace }}
-  annotations:
-    traefik.ingress.kubernetes.io/router.entrypoints: web
-spec:
-  ingressClassName: traefik
-  rules:
-    - host: ollama.kube.local
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: anythingllm
-                port:
-                  number: 3001
----
 # Entry point: flowise.kube.local → Flowise (RAG on OTEL logs with OpenSearch)
 kind: Ingress
 apiVersion: networking.k8s.io/v1
