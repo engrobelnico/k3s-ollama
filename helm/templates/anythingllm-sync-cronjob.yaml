@@ -81,8 +81,8 @@ spec:
 
                   def login():
                       req = Request(
-                          f"{ALLM}/api/system/check-token",
-                          data=json.dumps({"token": TOKEN}).encode(),
+                          f"{ALLM}/api/request-token",
+                          data=json.dumps({"username": "", "password": TOKEN}).encode(),
                           headers={"Content-Type": "application/json"},
                           method="POST"
                       )
@@ -98,7 +98,7 @@ spec:
 
                   def generate_api_key(jwt):
                       req = Request(
-                          f"{ALLM}/api/admin/generate-api-key",
+                          f"{ALLM}/api/system/generate-api-key",
                           data=b"{}",
                           headers={"Authorization": f"Bearer {jwt}", "Content-Type": "application/json"},
                           method="POST"
@@ -117,7 +117,7 @@ spec:
 
                   def delete_api_key(jwt, key_id):
                       req = Request(
-                          f"{ALLM}/api/admin/delete-api-key/{key_id}",
+                          f"{ALLM}/api/system/api-key/{key_id}",
                           headers={"Authorization": f"Bearer {jwt}"},
                           method="DELETE"
                       )
