@@ -19,3 +19,25 @@ spec:
                 name: anythingllm
                 port:
                   number: 3001
+---
+# Entry point: flowise.kube.local → Flowise (RAG on OTEL logs with OpenSearch)
+kind: Ingress
+apiVersion: networking.k8s.io/v1
+metadata:
+  name: flowise-webui
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: flowise.kube.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: flowise
+                port:
+                  number: 3000

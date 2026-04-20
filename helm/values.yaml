@@ -57,7 +57,7 @@ anythingllm:
   image:
     repository: mintplexlabs/anythingllm
     tag: latest
-    pullPolicy: IfNotPresent
+    pullPolicy: Always
 
   storage:
     size: 5Gi
@@ -67,6 +67,34 @@ anythingllm:
     embeddingModel: "nomic-embed-text"
     tokenLimit: 4096
     embeddingMaxChunkLength: 8192
+
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "200m"
+    limits:
+      memory: "1Gi"
+      cpu: "1000m"
+
+# Flowise — RAG builder with native OpenSearch VectorStore support
+# Access: http://flowise.kube.local (login with auth.username/password)
+# Setup job: creates otel-rag-vectors k-NN index, embeds OTEL logs, wires chatflow
+flowise:
+  image:
+    repository: flowiseai/flowise
+    tag: latest
+    pullPolicy: IfNotPresent
+
+  storage:
+    size: 2Gi
+
+  auth:
+    username: "admin"
+    password: "Flowise@K3s!2024"
+
+  opensearch:
+    vectorIndex: "otel-rag-vectors"
+    embeddingDim: 768   # nomic-embed-text output dimension
 
   resources:
     requests:

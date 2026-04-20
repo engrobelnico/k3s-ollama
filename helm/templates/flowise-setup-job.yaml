@@ -1,0 +1,464 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: flowise-setup
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: setup
+          image: python:3.11-alpine
+          command:
+            - python3
+            - -c
+            - |
+              import urllib.request, urllib.error, json, time, ssl, base64, sys
+              from urllib.request import Request
+              from datetime import datetime, timedelta, timezone
+
+              OLLAMA  = "http://ollama.ollama.svc.cluster.local:11434"
+              OS      = "https://opensearch.opensearch.svc.cluster.local:9200"
+              FLOWISE = "http://flowise.ollama.svc.cluster.local:3000"
+
+              with open("/os-creds/username")     as f: OS_USER = f.read().strip()
+              with open("/os-creds/password")     as f: OS_PASS = f.read().strip()
+              with open("/flowise-auth/username") as f: FW_USER = f.read().strip()
+              with open("/flowise-auth/password") as f: FW_PASS = f.read().strip()
+
+              ssl_ctx = ssl.create_default_context()
+              ssl_ctx.check_hostname = False
+              ssl_ctx.verify_mode    = ssl.CERT_NONE
+
+              VECTOR_INDEX = "otel-rag-vectors"
+              EMBED_DIM    = 768   # nomic-embed-text
+              MAX_LOGS     = 300
+              BATCH_EMBED  = 10
+
+              # ── Helpers ──────────────────────────────────────────────────
+              def os_req(method, path, data=None):
+                  creds = base64.b64encode(f"{OS_USER}:{OS_PASS}".encode()).decode()
+                  h = {"Authorization": f"Basic {creds}"}
+                  raw = None
+                  if data is not None:
+                      raw = json.dumps(data).encode()
+                      h["Content-Type"] = "application/json"
+                  req = Request(f"{OS}{path}", data=raw, headers=h, method=method)
+                  try:
+                      with urllib.request.urlopen(req, context=ssl_ctx, timeout=60) as r:
+                          body = r.read()
+                          return json.loads(body) if body else {}
+                  except urllib.error.HTTPError as e:
+                      body = e.read().decode(errors="replace")
+                      print(f"  HTTP {e.code} {method} {path}: {body[:200]}")
+                      return {"_error": e.code}
+                  except Exception as e:
+                      print(f"  ERR {method} {path}: {e}")
+                      return {}
+
+              def os_bulk(docs):
+                  creds = base64.b64encode(f"{OS_USER}:{OS_PASS}".encode()).decode()
+                  body = ""
+                  for d in docs:
+                      body += json.dumps({"index": {"_index": VECTOR_INDEX}}) + "\n"
+                      body += json.dumps(d) + "\n"
+                  req = Request(
+                      f"{OS}/_bulk", data=body.encode(),
+                      headers={"Authorization": f"Basic {creds}",
+                               "Content-Type": "application/x-ndjson"},
+                      method="POST"
+                  )
+                  try:
+                      with urllib.request.urlopen(req, context=ssl_ctx, timeout=120) as r:
+                          resp = json.loads(r.read())
+                          errs = [i for i in resp.get("items", []) if "error" in i.get("index", {})]
+                          if errs:
+                              print(f"  Bulk errors: {len(errs)}")
+                          return len(resp.get("items", [])) - len(errs)
+                  except Exception as e:
+                      print(f"  ERR bulk: {e}")
+                      return 0
+
+              def embed_text(text):
+                  text = text[:2000]  # keep well within nomic-embed-text token limit
+                  data = json.dumps({"model": "nomic-embed-text", "prompt": text}).encode()
+                  req = Request(
+                      f"{OLLAMA}/api/embeddings", data=data,
+                      headers={"Content-Type": "application/json"}, method="POST"
+                  )
+                  try:
+                      with urllib.request.urlopen(req, timeout=60) as r:
+                          return json.loads(r.read()).get("embedding")
+                  except Exception as e:
+                      print(f"  ERR embed: {e}")
+                      return None
+
+              def fw_req(method, path, data=None, token=None):
+                  h = {"Accept": "application/json"}
+                  if token:
+                      h["Authorization"] = f"Bearer {token}"
+                  raw = None
+                  if data is not None:
+                      raw = json.dumps(data).encode()
+                      h["Content-Type"] = "application/json"
+                  req = Request(f"{FLOWISE}{path}", data=raw, headers=h, method=method)
+                  try:
+                      with urllib.request.urlopen(req, timeout=60) as r:
+                          body = r.read()
+                          return json.loads(body) if body else {}
+                  except urllib.error.HTTPError as e:
+                      body = e.read().decode(errors="replace")
+                      print(f"  HTTP {e.code} {method} {path}: {body[:200]}")
+                      return {"_error": e.code}
+                  except Exception as e:
+                      print(f"  ERR fw {method} {path}: {e}")
+                      return {}
+
+              # ── 0. Wait for OpenSearch ────────────────────────────────────
+              print("=== Waiting for OpenSearch...")
+              creds_hdr = base64.b64encode(f"{OS_USER}:{OS_PASS}".encode()).decode()
+              for _ in range(60):
+                  try:
+                      urllib.request.urlopen(
+                          Request(f"{OS}/_cluster/health",
+                                  headers={"Authorization": f"Basic {creds_hdr}"}),
+                          context=ssl_ctx, timeout=5)
+                      break
+                  except Exception:
+                      time.sleep(5)
+              else:
+                  sys.exit("OpenSearch not ready after 5 min")
+              print("=== OpenSearch ready")
+
+              # ── 1. Wait for Ollama ────────────────────────────────────────
+              print("=== Waiting for Ollama...")
+              for _ in range(60):
+                  try:
+                      urllib.request.urlopen(f"{OLLAMA}/api/tags", timeout=5)
+                      break
+                  except Exception:
+                      time.sleep(5)
+              else:
+                  sys.exit("Ollama not ready after 5 min")
+              print("=== Ollama ready")
+
+              # ── 2. Create k-NN index ──────────────────────────────────────
+              print(f"=== Ensuring k-NN index '{VECTOR_INDEX}'...")
+              idx_info = os_req("GET", f"/{VECTOR_INDEX}")
+              if VECTOR_INDEX not in idx_info:
+                  resp = os_req("PUT", f"/{VECTOR_INDEX}", {
+                      "settings": {
+                          "index.knn": True,
+                          "number_of_shards": 1,
+                          "number_of_replicas": 0
+                      },
+                      "mappings": {
+                          "properties": {
+                              "embedding": {
+                                  "type": "knn_vector",
+                                  "dimension": EMBED_DIM,
+                                  "method": {
+                                      "name": "hnsw",
+                                      "engine": "lucene",
+                                      "space_type": "l2"
+                                  }
+                              },
+                              "text":     {"type": "text"},
+                              "metadata": {"type": "object", "enabled": True}
+                          }
+                      }
+                  })
+                  if resp.get("acknowledged"):
+                      print(f"  Created k-NN index '{VECTOR_INDEX}' (lucene engine, dim={EMBED_DIM})")
+                  else:
+                      print(f"  Index creation response: {resp}")
+              else:
+                  print(f"  Index '{VECTOR_INDEX}' already exists")
+
+              # ── 3. Check existing doc count ───────────────────────────────
+              count_resp = os_req("GET", f"/{VECTOR_INDEX}/_count")
+              existing_count = count_resp.get("count", 0)
+              print(f"=== Current docs in '{VECTOR_INDEX}': {existing_count}")
+
+              if existing_count < MAX_LOGS // 2:
+                  # ── 4. Fetch OTEL logs ────────────────────────────────────
+                  print("=== Fetching OTEL logs from OpenSearch...")
+                  indices_resp = os_req("GET", "/_cat/indices/otel-logs-*?format=json")
+                  if not indices_resp or not isinstance(indices_resp, list):
+                      print("  WARNING: No otel-logs-* indices found — skipping indexing")
+                  else:
+                      SINCE_ISO = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                      result = os_req("POST", "/otel-logs-*/_search", {
+                          "size": MAX_LOGS,
+                          "sort": [{"time": {"order": "desc"}}],
+                          "query": {
+                              "bool": {
+                                  "must": [{"range": {"time": {"gte": SINCE_ISO}}}],
+                                  "should": [{"exists": {"field": "body"}},
+                                             {"exists": {"field": "log"}}],
+                                  "minimum_should_match": 1
+                              }
+                          }
+                      })
+                      hits = result.get("hits", {}).get("hits", [])
+                      print(f"  Fetched {len(hits)} log entries")
+
+                      if hits:
+                          # ── 5. Embed and bulk-index ───────────────────────
+                          print("=== Embedding and indexing logs into OpenSearch k-NN index...")
+                          docs_to_index = []
+                          ok = 0
+                          for i, hit in enumerate(hits):
+                              src  = hit.get("_source", {})
+                              body_f = src.get("body") or src.get("log") or ""
+                              sev    = src.get("severityText") or src.get("severity") or "INFO"
+                              ts     = src.get("time") or src.get("@timestamp") or ""
+                              svc    = (src.get("resource.service.name") or
+                                        src.get("serviceName") or "unknown")
+                              text = f"[{sev}] {ts} svc={svc}: {body_f}"
+                              vec  = embed_text(text)
+                              if vec is None:
+                                  continue
+                              docs_to_index.append({
+                                  "embedding": vec,
+                                  "text": text,
+                                  "metadata": {
+                                      "source": "otel-logs",
+                                      "severity": sev,
+                                      "timestamp": ts,
+                                      "service": svc
+                                  }
+                              })
+                              if len(docs_to_index) >= BATCH_EMBED:
+                                  ok += os_bulk(docs_to_index)
+                                  docs_to_index = []
+                                  print(f"  Progress: {ok}/{len(hits)} indexed")
+                          if docs_to_index:
+                              ok += os_bulk(docs_to_index)
+                          print(f"=== Indexed {ok} documents into '{VECTOR_INDEX}'")
+              else:
+                  print(f"=== Index already has {existing_count} docs — skipping indexing")
+
+              # ── 6. Wait for Flowise ───────────────────────────────────────
+              print("=== Waiting for Flowise...")
+              for _ in range(60):
+                  try:
+                      urllib.request.urlopen(f"{FLOWISE}/api/v1/version", timeout=5)
+                      break
+                  except Exception:
+                      time.sleep(5)
+              else:
+                  sys.exit("Flowise not ready after 5 min")
+              print("=== Flowise ready")
+
+              # ── 7. Login to Flowise ───────────────────────────────────────
+              print("=== Logging in to Flowise...")
+              login_resp = fw_req("POST", "/api/v1/login",
+                                  {"username": FW_USER, "password": FW_PASS})
+              token = login_resp.get("token")
+              if not token:
+                  sys.exit(f"Flowise login failed: {login_resp}")
+              print("=== Logged in to Flowise")
+
+              # ── 8. Create OpenSearch credential ──────────────────────────
+              print("=== Ensuring OpenSearch credential in Flowise...")
+              creds_resp = fw_req("GET", "/api/v1/credentials", token=token)
+              creds_list = creds_resp if isinstance(creds_resp, list) else []
+              cred_id = next((c["id"] for c in creds_list
+                              if c.get("name") == "OpenSearch OTEL"), None)
+              if cred_id:
+                  print(f"  Credential 'OpenSearch OTEL' already exists (id: {cred_id})")
+              else:
+                  new_cred = fw_req("POST", "/api/v1/credentials", {
+                      "name": "OpenSearch OTEL",
+                      "credentialName": "openSearchUrl",
+                      "plainDataObj": {
+                          "openSearchUrl": OS,
+                          "user": OS_USER,
+                          "password": OS_PASS
+                      }
+                  }, token=token)
+                  cred_id = new_cred.get("id")
+                  if cred_id:
+                      print(f"  Created credential 'OpenSearch OTEL' (id: {cred_id})")
+                  else:
+                      print(f"  WARNING: credential creation response: {new_cred}")
+
+              # ── 9. Create RAG chatflow ────────────────────────────────────
+              print("=== Ensuring OTEL RAG chatflow in Flowise...")
+              flows_resp = fw_req("GET", "/api/v1/chatflows", token=token)
+              flows_list = flows_resp if isinstance(flows_resp, list) else []
+              flow_id = next((f["id"] for f in flows_list
+                              if f.get("name") == "OTEL Logs RAG"), None)
+              if flow_id:
+                  print(f"  Chatflow 'OTEL Logs RAG' already exists (id: {flow_id})")
+              else:
+                  OLLAMA_BASE = "http://ollama.ollama.svc.cluster.local:11434"
+                  flow_data = {
+                      "nodes": [
+                          {
+                              "id": "chatOllama_0",
+                              "type": "customNode",
+                              "position": {"x": 100, "y": 50},
+                              "data": {
+                                  "id": "chatOllama_0",
+                                  "label": "ChatOllama",
+                                  "name": "chatOllama",
+                                  "version": 4,
+                                  "type": "ChatOllama",
+                                  "baseClasses": ["ChatOllama", "BaseChatModel",
+                                                  "BaseLanguageModel", "Runnable"],
+                                  "inputs": {
+                                      "baseUrl": OLLAMA_BASE,
+                                      "modelName": "llama3.2:3b",
+                                      "temperature": 0,
+                                      "topP": 0.9
+                                  },
+                                  "outputs": {}
+                              },
+                              "width": 300, "height": 600
+                          },
+                          {
+                              "id": "ollamaEmbedding_0",
+                              "type": "customNode",
+                              "position": {"x": 100, "y": 700},
+                              "data": {
+                                  "id": "ollamaEmbedding_0",
+                                  "label": "Ollama Embeddings",
+                                  "name": "ollamaEmbedding",
+                                  "version": 3,
+                                  "type": "OllamaEmbeddings",
+                                  "baseClasses": ["OllamaEmbeddings", "Embeddings"],
+                                  "inputs": {
+                                      "baseUrl": OLLAMA_BASE,
+                                      "modelName": "nomic-embed-text"
+                                  },
+                                  "outputs": {}
+                              },
+                              "width": 300, "height": 400
+                          },
+                          {
+                              "id": "openSearch_0",
+                              "type": "customNode",
+                              "position": {"x": 550, "y": 300},
+                              "data": {
+                                  "id": "openSearch_0",
+                                  "label": "OpenSearch",
+                                  "name": "openSearch",
+                                  "version": 4,
+                                  "type": "OpenSearch",
+                                  "baseClasses": ["OpenSearch",
+                                                  "VectorStoreRetriever", "BaseRetriever"],
+                                  "credential": cred_id,
+                                  "inputs": {
+                                      "embeddings": "",
+                                      "indexName": VECTOR_INDEX,
+                                      "topK": 4
+                                  },
+                                  "outputs": {"output": "retriever"}
+                              },
+                              "width": 300, "height": 600
+                          },
+                          {
+                              "id": "convChain_0",
+                              "type": "customNode",
+                              "position": {"x": 1050, "y": 300},
+                              "data": {
+                                  "id": "convChain_0",
+                                  "label": "Conversational Retrieval QA Chain",
+                                  "name": "conversationalRetrievalQAChain",
+                                  "version": 3,
+                                  "type": "ConversationalRetrievalQAChain",
+                                  "baseClasses": ["ConversationalRetrievalQAChain",
+                                                  "BaseChain", "Runnable"],
+                                  "inputs": {
+                                      "model": "",
+                                      "vectorStoreRetriever": "",
+                                      "systemMessagePrompt": (
+                                          "You are an expert in analyzing OpenTelemetry logs "
+                                          "and distributed tracing. Answer questions about "
+                                          "system behavior, errors, performance issues, and "
+                                          "service interactions based on the provided log excerpts."
+                                      ),
+                                      "returnSourceDocuments": True,
+                                      "rephraseQuestion": True
+                                  },
+                                  "outputs": {}
+                              },
+                              "width": 300, "height": 700
+                          }
+                      ],
+                      "edges": [
+                          {
+                              "id": "e_embed_os",
+                              "source": "ollamaEmbedding_0",
+                              "target": "openSearch_0",
+                              "sourceHandle": "ollamaEmbedding_0-output-ollamaEmbedding-OllamaEmbeddings|Embeddings",
+                              "targetHandle": "openSearch_0-input-embeddings-Embeddings",
+                              "type": "buttonedge"
+                          },
+                          {
+                              "id": "e_os_chain",
+                              "source": "openSearch_0",
+                              "target": "convChain_0",
+                              "sourceHandle": "openSearch_0-output-retriever-VectorStoreRetriever|BaseRetriever",
+                              "targetHandle": "convChain_0-input-vectorStoreRetriever-VectorStoreRetriever|BaseRetriever",
+                              "type": "buttonedge"
+                          },
+                          {
+                              "id": "e_llm_chain",
+                              "source": "chatOllama_0",
+                              "target": "convChain_0",
+                              "sourceHandle": "chatOllama_0-output-chatOllama-ChatOllama|BaseChatModel|BaseLanguageModel|Runnable",
+                              "targetHandle": "convChain_0-input-model-BaseChatModel",
+                              "type": "buttonedge"
+                          }
+                      ],
+                      "viewport": {"x": 0, "y": 0, "zoom": 0.75}
+                  }
+                  new_flow = fw_req("POST", "/api/v1/chatflows", {
+                      "name": "OTEL Logs RAG",
+                      "flowData": json.dumps(flow_data),
+                      "type": "CHATFLOW"
+                  }, token=token)
+                  flow_id = new_flow.get("id")
+                  if flow_id:
+                      print(f"  Created chatflow 'OTEL Logs RAG' (id: {flow_id})")
+                  else:
+                      print(f"  WARNING: chatflow creation: {new_flow}")
+
+              print("=== Setup complete!")
+              print(f"  Vector index : {VECTOR_INDEX} ({existing_count} existing docs)")
+              print(f"  Credential   : OpenSearch OTEL ({cred_id})")
+              print(f"  Chatflow     : OTEL Logs RAG ({flow_id})")
+              print(f"  Flowise UI   : http://flowise.kube.local")
+          volumeMounts:
+            - name: os-creds
+              mountPath: /os-creds
+              readOnly: true
+            - name: flowise-auth
+              mountPath: /flowise-auth
+              readOnly: true
+      volumes:
+        - name: os-creds
+          secret:
+            secretName: opensearch-admin-password
+            items:
+              - key: username
+                path: username
+              - key: password
+                path: password
+        - name: flowise-auth
+          secret:
+            secretName: flowise-auth
+            items:
+              - key: username
+                path: username
+              - key: password
+                path: password

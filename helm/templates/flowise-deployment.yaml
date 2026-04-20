@@ -1,0 +1,96 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: flowise-storage
+  namespace: {{ .Release.Namespace }}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: {{ .Values.flowise.storage.size }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flowise
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: flowise
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: flowise
+  template:
+    metadata:
+      labels:
+        app: flowise
+    spec:
+      containers:
+        - name: flowise
+          image: "{{ .Values.flowise.image.repository }}:{{ .Values.flowise.image.tag }}"
+          imagePullPolicy: {{ .Values.flowise.image.pullPolicy }}
+          ports:
+            - containerPort: 3000
+          env:
+            - name: PORT
+              value: "3000"
+            - name: FLOWISE_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: flowise-auth
+                  key: username
+            - name: FLOWISE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: flowise-auth
+                  key: password
+            - name: DATABASE_PATH
+              value: /data
+            - name: SECRETKEY_PATH
+              value: /data
+            - name: LOG_PATH
+              value: /data/logs
+            - name: BLOB_STORAGE_PATH
+              value: /data/storage
+            - name: DISABLE_FLOWISE_TELEMETRY
+              value: "true"
+            # Required for self-signed OpenSearch certificates in local k3s
+            - name: NODE_TLS_REJECT_UNAUTHORIZED
+              value: "0"
+          volumeMounts:
+            - name: storage
+              mountPath: /data
+          resources:
+            requests:
+              memory: {{ .Values.flowise.resources.requests.memory | quote }}
+              cpu: {{ .Values.flowise.resources.requests.cpu | quote }}
+            limits:
+              memory: {{ .Values.flowise.resources.limits.memory | quote }}
+              cpu: {{ .Values.flowise.resources.limits.cpu | quote }}
+          readinessProbe:
+            httpGet:
+              path: /api/v1/version
+              port: 3000
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 6
+      volumes:
+        - name: storage
+          persistentVolumeClaim:
+            claimName: flowise-storage
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: flowise
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: flowise
+spec:
+  selector:
+    app: flowise
+  ports:
+    - port: 3000
+      targetPort: 3000
+  type: ClusterIP
