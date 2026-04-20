@@ -194,10 +194,10 @@ spec:
               ns_key  = next((k for k in doc if "namespace" in k and k.startswith("resource")), None)
               print(f"    Fields detected: body={body_field}, ts={ts_field}, pod={pod_key}, ns={ns_key}")
 
-              # Fetch last 7 days (max 2000 docs)
+              # Fetch last 7 days (max 300 docs — keep chunks under nomic-embed-text 8192 token limit)
               SINCE_ISO = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
               result = os_req("POST", "/otel-logs-*/_search", {
-                  "size": 2000,
+                  "size": 300,
                   "sort": [{ts_field: {"order": "desc"}}],
                   "query": {"range": {ts_field: {"gte": SINCE_ISO}}},
                   "_source": [body_field, sev_field, ts_field] + (
