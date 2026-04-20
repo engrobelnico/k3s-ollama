@@ -217,7 +217,9 @@ spec:
 
                   # 7. Prune workspace embeddings older than 24h
                   ws_detail = allm("GET", f"/api/v1/workspace/{slug}", api_key=api_key)
-                  ws_docs = ws_detail.get("workspace", {}).get("documents", [])
+                  ws_list = ws_detail.get("workspace", [])
+                  ws_obj = ws_list[0] if isinstance(ws_list, list) and ws_list else (ws_list if isinstance(ws_list, dict) else {})
+                  ws_docs = ws_obj.get("documents", [])
                   cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime("%Y%m%dT%H%M")
                   to_delete = []
                   for d in ws_docs:
