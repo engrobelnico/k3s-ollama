@@ -44,6 +44,11 @@ spec:
                 secretKeyRef:
                   name: anythingllm-auth
                   key: token
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: anythingllm-jwt
+                  key: secret
             # LLM: Ollama
             - name: LLM_PROVIDER
               value: ollama

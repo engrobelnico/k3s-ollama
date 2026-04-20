@@ -16,3 +16,8 @@ Open WebUI → Ollama (génération réponse)
 
 Après git push et déploiement, dans Open WebUI → Workspace > Knowledge → ajouter la collection rag-logs comme source RAG.
 
+## to rotate password
+
+sudo kubectl patch secret open-webui-admin -n ollama \
+  --type=merge -p "{\"data\":{\"password\":\"$(echo -n 'NewPass!' | base64)\"}}"
+

@@ -38,8 +38,10 @@ spec:
                   ssl_ctx.check_hostname = False
                   ssl_ctx.verify_mode = ssl.CERT_NONE
 
-                  def allm(method, path, data=None, raw_data=None, content_type=None, timeout=60):
-                      h = {"Authorization": f"Bearer {TOKEN}", "Accept": "application/json"}
+                  def allm(method, path, data=None, raw_data=None, content_type=None, timeout=60, api_key=None):
+                      h = {"Accept": "application/json"}
+                      if api_key:
+                          h["Authorization"] = f"Bearer {api_key}"
                       if data is not None:
                           raw_data = json.dumps(data).encode()
                           h["Content-Type"] = "application/json"
@@ -77,19 +79,72 @@ spec:
                           print(f"  ERROR {method} {path}: {e}")
                           return {}
 
-                  # 0. Get workspace slug
-                  ws_resp = allm("GET", "/api/v0/workspaces")
+                  def login():
+                      req = Request(
+                          f"{ALLM}/api/system/check-token",
+                          data=json.dumps({"token": TOKEN}).encode(),
+                          headers={"Content-Type": "application/json"},
+                          method="POST"
+                      )
+                      try:
+                          with urllib.request.urlopen(req, timeout=30) as r:
+                              resp = json.loads(r.read())
+                      except Exception as e:
+                          sys.exit(f"Login failed: {e}")
+                      jwt = resp.get("token")
+                      if not jwt:
+                          sys.exit(f"Login failed — no token in: {resp}")
+                      return jwt
+
+                  def generate_api_key(jwt):
+                      req = Request(
+                          f"{ALLM}/api/admin/generate-api-key",
+                          data=b"{}",
+                          headers={"Authorization": f"Bearer {jwt}", "Content-Type": "application/json"},
+                          method="POST"
+                      )
+                      try:
+                          with urllib.request.urlopen(req, timeout=30) as r:
+                              resp = json.loads(r.read())
+                      except Exception as e:
+                          sys.exit(f"API key generation failed: {e}")
+                      obj = resp.get("apiKey", {})
+                      secret = obj.get("secret")
+                      key_id = obj.get("id")
+                      if not secret:
+                          sys.exit(f"API key generation failed: {resp}")
+                      return secret, key_id
+
+                  def delete_api_key(jwt, key_id):
+                      req = Request(
+                          f"{ALLM}/api/admin/delete-api-key/{key_id}",
+                          headers={"Authorization": f"Bearer {jwt}"},
+                          method="DELETE"
+                      )
+                      try:
+                          with urllib.request.urlopen(req, timeout=30) as r:
+                              r.read()
+                      except Exception as e:
+                          print(f"  WARNING: Could not delete API key {key_id}: {e}")
+
+                  # 0. Login and get API key
+                  jwt = login()
+                  api_key, api_key_id = generate_api_key(jwt)
+
+                  # 1. Get workspace slug
+                  ws_resp = allm("GET", "/api/v1/workspaces", api_key=api_key)
                   workspaces = ws_resp.get("workspaces", [])
                   slug = next((w["slug"] for w in workspaces if w.get("name") == "log-analysis"), None)
                   if not slug:
+                      delete_api_key(jwt, api_key_id)
                       sys.exit("Workspace 'log-analysis' not found — run anythingllm-setup first")
                   print(f"=== Workspace: {slug}")
 
-                  # 1. Detect field layout from sample doc
+                  # 2. Detect field layout from sample doc
                   sample = os_req("POST", "/otel-logs-*/_search", {"size": 1})
                   hits_s = sample.get("hits", {}).get("hits", [])
                   if not hits_s:
-                      print("No docs in otel-logs-*, skipping."); sys.exit(0)
+                      print("No docs in otel-logs-*, skipping."); delete_api_key(jwt, api_key_id); sys.exit(0)
                   doc = hits_s[0].get("_source", {})
                   body_field = "body" if "body" in doc else "log"
                   sev_field  = "severityText" if "severityText" in doc else "severity"
@@ -98,7 +153,7 @@ spec:
                                   and k.startswith("resource")), None)
                   ns_key  = next((k for k in doc if "namespace" in k and k.startswith("resource")), None)
 
-                  # 2. Fetch last 2h of logs (max 1000 docs)
+                  # 3. Fetch last 2h of logs (max 1000 docs)
                   SINCE_ISO = (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
                   result = os_req("POST", "/otel-logs-*/_search", {
                       "size": 1000,
@@ -110,9 +165,11 @@ spec:
                   hits = result.get("hits", {}).get("hits", [])
                   print(f"=== Got {len(hits)} docs from last 2h (since {SINCE_ISO})")
                   if not hits:
-                      print("No new logs in last 2h, skipping."); sys.exit(0)
+                      print("No new logs in last 2h, skipping.")
+                      delete_api_key(jwt, api_key_id)
+                      sys.exit(0)
 
-                  # 3. Build text content
+                  # 4. Build text content
                   lines = []
                   for h in hits:
                       s = h.get("_source", {})
@@ -126,7 +183,7 @@ spec:
                       lines.append(f"[{ts}] [{sev}] [{ns}/{pod}] {body}")
                   content = "\n".join(lines).encode("utf-8")
 
-                  # 4. Upload document with hourly timestamp in filename
+                  # 5. Upload document with hourly timestamp in filename
                   now_str  = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M")
                   filename = f"otel-logs-{now_str}.txt"
                   boundary = "----AnythingLLMSyncBoundary"
@@ -138,46 +195,44 @@ spec:
 
                   print(f"=== Uploading {filename} ({len(lines)} lines)...")
                   upload_resp = allm(
-                      "POST", "/api/v0/document/upload",
+                      "POST", "/api/v1/document/upload",
                       raw_data=parts,
                       content_type=f"multipart/form-data; boundary={boundary}",
-                      timeout=120
+                      timeout=120,
+                      api_key=api_key
                   )
                   documents = upload_resp.get("documents", [])
                   if not documents:
+                      delete_api_key(jwt, api_key_id)
                       sys.exit(f"Upload failed: {upload_resp}")
                   doc_location = documents[0].get("location")
                   print(f"    Location: {doc_location}")
 
-                  # 5. Embed into workspace
+                  # 6. Embed into workspace
                   print(f"=== Embedding into workspace '{slug}'...")
-                  embed_resp = allm("POST", f"/api/v0/workspace/{slug}/update-embeddings", {
+                  embed_resp = allm("POST", f"/api/v1/workspace/{slug}/update-embeddings", {
                       "adds": [doc_location], "deletes": []
-                  }, timeout=300)
+                  }, timeout=300, api_key=api_key)
                   print(f"    Embedded: {embed_resp}")
 
-                  # 6. Prune documents older than 24h from workspace
-                  # List workspace documents and delete those older than 24h
-                  ws_docs_resp = allm("GET", f"/api/v0/workspace/{slug}")
-                  ws_docs = ws_docs_resp.get("workspace", {}).get("documents", [])
+                  # 7. Prune workspace embeddings older than 24h
+                  ws_detail = allm("GET", f"/api/v1/workspace/{slug}", api_key=api_key)
+                  ws_docs = ws_detail.get("workspace", {}).get("documents", [])
                   cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime("%Y%m%dT%H%M")
                   to_delete = []
                   for d in ws_docs:
-                      loc = d.get("docpath", "")
-                      # filename pattern: custom-docs/otel-logs-YYYYMMDDTHHMM.txt
+                      loc = d.get("docpath", d.get("location", ""))
                       basename = loc.split("/")[-1]
                       if basename.startswith("otel-logs-") and basename < f"otel-logs-{cutoff}.txt":
                           to_delete.append(loc)
                   if to_delete:
-                      print(f"=== Pruning {len(to_delete)} old documents from workspace...")
-                      prune_resp = allm("POST", f"/api/v0/workspace/{slug}/update-embeddings", {
+                      print(f"=== Pruning {len(to_delete)} old document embeddings from workspace...")
+                      prune_resp = allm("POST", f"/api/v1/workspace/{slug}/update-embeddings", {
                           "adds": [], "deletes": to_delete
-                      }, timeout=60)
+                      }, timeout=60, api_key=api_key)
                       print(f"    Pruned: {prune_resp}")
-                      for loc in to_delete:
-                          fname = loc.split("/")[-1].replace(".txt", "")
-                          allm("DELETE", f"/api/v0/document/custom-docs%2F{fname}.txt")
 
+                  delete_api_key(jwt, api_key_id)
                   print(f"=== Sync complete: {len(lines)} logs uploaded, {len(to_delete)} old docs pruned")
               volumeMounts:
                 - name: allm-auth

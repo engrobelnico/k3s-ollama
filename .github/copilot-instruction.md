@@ -108,6 +108,7 @@ Before starting a new task in the above plan, update progress in the plan.
 This project is a deployement of opensearch stack threw argocd and opensearch-operator on k3s local cluster
 
 This project depends on the [opensearch], [argocd], and deplloy a LLM to interogate opnsearch logs and metrics
+He use opsensearch vector database as knowledge database, and add to it a LLM to give capacity to interogate logs in common lungauage
 
 ## Règles de réponse
 - Sois concis.
