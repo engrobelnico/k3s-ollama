@@ -56,7 +56,7 @@ ollama:
 flowise:
   image:
     repository: flowiseai/flowise
-    tag: latest
+    tag: "2"
     pullPolicy: IfNotPresent
 
   storage:
