@@ -57,7 +57,7 @@ anythingllm:
   image:
     repository: mintplexlabs/anythingllm
     tag: latest
-    pullPolicy: IfNotPresent
+    pullPolicy: Always
 
   storage:
     size: 5Gi
