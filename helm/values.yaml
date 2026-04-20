@@ -12,6 +12,21 @@ ollama:
       mountPath: /etc/ssl/certs
       readOnly: true
 
+  # Override lifecycle to avoid CrashLoopBackOff when model pull fails due to network issues.
+  # The model is already persisted on the PVC; || true ensures the pod starts even if pull fails.
+  lifecycle:
+    postStart:
+      exec:
+        command:
+          - /bin/sh
+          - -c
+          - |
+            while ! /bin/ollama ps > /dev/null 2>&1; do
+              sleep 5
+            done
+            /bin/ollama pull llama3.2:3b || true
+            /bin/ollama pull nomic-embed-text || true
+
   ollama:
     # Models to pull on startup — choose based on available RAM/CPU
     # llama3.2:3b ~2GB RAM, good for CPU-only
