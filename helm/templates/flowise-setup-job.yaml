@@ -100,9 +100,13 @@ spec:
                       return None
 
               def fw_req(method, path, data=None, token=None):
-                  h = {"Accept": "application/json"}
-                  if token:
-                      h["Authorization"] = f"Bearer {token}"
+                  # Flowise 2.x uses HTTP Basic Auth + x-request-from: internal header
+                  creds = base64.b64encode(f"{FW_USER}:{FW_PASS}".encode()).decode()
+                  h = {
+                      "Accept": "application/json",
+                      "Authorization": f"Basic {creds}",
+                      "x-request-from": "internal"
+                  }
                   raw = None
                   if data is not None:
                       raw = json.dumps(data).encode()
@@ -257,18 +261,16 @@ spec:
                   sys.exit("Flowise not ready after 5 min")
               print("=== Flowise ready")
 
-              # ── 7. Login to Flowise ───────────────────────────────────────
-              print("=== Logging in to Flowise...")
-              login_resp = fw_req("POST", "/api/v1/login",
-                                  {"username": FW_USER, "password": FW_PASS})
-              token = login_resp.get("token")
-              if not token:
-                  sys.exit(f"Flowise login failed: {login_resp}")
-              print("=== Logged in to Flowise")
+              # ── 7. Verify Flowise auth ────────────────────────────────────
+              print("=== Verifying Flowise Basic Auth...")
+              verify_resp = fw_req("GET", "/api/v1/chatflows")
+              if isinstance(verify_resp, dict) and verify_resp.get("_error") == 401:
+                  sys.exit("Flowise auth failed: check FLOWISE_USERNAME/FLOWISE_PASSWORD")
+              print("=== Flowise auth OK")
 
               # ── 8. Create OpenSearch credential ──────────────────────────
               print("=== Ensuring OpenSearch credential in Flowise...")
-              creds_resp = fw_req("GET", "/api/v1/credentials", token=token)
+              creds_resp = fw_req("GET", "/api/v1/credentials")
               creds_list = creds_resp if isinstance(creds_resp, list) else []
               cred_id = next((c["id"] for c in creds_list
                               if c.get("name") == "OpenSearch OTEL"), None)
@@ -283,7 +285,7 @@ spec:
                           "user": OS_USER,
                           "password": OS_PASS
                       }
-                  }, token=token)
+                  })
                   cred_id = new_cred.get("id")
                   if cred_id:
                       print(f"  Created credential 'OpenSearch OTEL' (id: {cred_id})")
@@ -292,7 +294,7 @@ spec:
 
               # ── 9. Create RAG chatflow ────────────────────────────────────
               print("=== Ensuring OTEL RAG chatflow in Flowise...")
-              flows_resp = fw_req("GET", "/api/v1/chatflows", token=token)
+              flows_resp = fw_req("GET", "/api/v1/chatflows")
               flows_list = flows_resp if isinstance(flows_resp, list) else []
               flow_id = next((f["id"] for f in flows_list
                               if f.get("name") == "OTEL Logs RAG"), None)
@@ -426,7 +428,7 @@ spec:
                       "name": "OTEL Logs RAG",
                       "flowData": json.dumps(flow_data),
                       "type": "CHATFLOW"
-                  }, token=token)
+                  })
                   flow_id = new_flow.get("id")
                   if flow_id:
                       print(f"  Created chatflow 'OTEL Logs RAG' (id: {flow_id})")
