@@ -296,7 +296,158 @@ spec:
               print(f"  Vector index : {VECTOR_INDEX} ({existing_count} existing docs)")
               print(f"  Credential   : OpenSearch OTEL ({cred_id})")
               print(f"  Flowise UI   : http://flowise.kube.local")
-              print(f"  NOTE: Create the RAG chatflow manually in Flowise UI")
+
+              # ── 9. Create RAG chatflow ────────────────────────────────────
+              print("=== Ensuring OTEL RAG chatflow in Flowise...")
+              flows_resp = fw_req("GET", "/api/v1/chatflows")
+              flows_list = flows_resp if isinstance(flows_resp, list) else []
+              flow_id = next((f["id"] for f in flows_list
+                              if f.get("name") == "OTEL Logs RAG"), None)
+              if flow_id:
+                  print(f"  Chatflow 'OTEL Logs RAG' already exists (id: {flow_id})")
+              else:
+                  # Fetch node definitions from Flowise to build proper inputAnchors/inputParams/outputAnchors
+                  PARAM_TYPES = {"string","number","boolean","password","json","code","date",
+                                 "file","folder","options","multiOptions","datagrid","tabs"}
+
+                  def get_node_def(name):
+                      return fw_req("GET", f"/api/v1/nodes/{name}")
+
+                  def build_node_data(node_def, node_id, user_inputs, cred=None):
+                      """Build a proper Flowise node data object with inputAnchors/inputParams/outputAnchors."""
+                      inputs_def = node_def.get("inputs", [])
+                      input_anchors = []
+                      input_params = []
+                      for inp in inputs_def:
+                          entry = dict(inp)
+                          entry["id"] = f"{node_id}-input-{inp['name']}-{inp['type']}"
+                          if inp["type"] in PARAM_TYPES:
+                              input_params.append(entry)
+                          else:
+                              input_anchors.append(entry)
+
+                      # Build outputAnchors from outputs or baseClasses
+                      output_anchors = []
+                      outputs_def = node_def.get("outputs", [])
+                      if outputs_def:
+                          for out in outputs_def:
+                              output_anchors.append({
+                                  "id": f"{node_id}-output-{out['name']}-{'-'.join(out.get('baseClasses',[]))}",
+                                  "name": out["name"],
+                                  "label": out["label"],
+                                  "type": out.get("baseClasses", [""])[0],
+                                  "baseClasses": out.get("baseClasses", [])
+                              })
+                      else:
+                          bc = node_def.get("baseClasses", [])
+                          output_anchors.append({
+                              "id": f"{node_id}-output-{node_def['name']}-{'|'.join(bc)}",
+                              "name": node_def["name"],
+                              "label": node_def["label"],
+                              "type": bc[0] if bc else "",
+                              "baseClasses": bc
+                          })
+
+                      data = {
+                          "id": node_id,
+                          "label": node_def["label"],
+                          "version": node_def["version"],
+                          "name": node_def["name"],
+                          "type": node_def["type"],
+                          "baseClasses": node_def["baseClasses"],
+                          "category": node_def.get("category", ""),
+                          "description": node_def.get("description", ""),
+                          "inputAnchors": input_anchors,
+                          "inputParams": input_params,
+                          "outputAnchors": output_anchors,
+                          "inputs": user_inputs,
+                          "outputs": {}
+                      }
+                      if cred is not None:
+                          data["credential"] = cred
+                      return data
+
+                  OLLAMA_BASE = "http://ollama.ollama.svc.cluster.local:11434"
+
+                  # Fetch node definitions
+                  chat_def  = get_node_def("chatOllama")
+                  embed_def = get_node_def("ollamaEmbedding")
+                  os_def    = get_node_def("openSearch")
+                  chain_def = get_node_def("conversationalRetrievalQAChain")
+
+                  chat_data = build_node_data(chat_def, "chatOllama_0", {
+                      "baseUrl": OLLAMA_BASE,
+                      "modelName": "llama3.2:3b",
+                      "temperature": "0",
+                      "topP": "0.9"
+                  })
+                  embed_data = build_node_data(embed_def, "ollamaEmbedding_0", {
+                      "baseUrl": OLLAMA_BASE,
+                      "modelName": "nomic-embed-text"
+                  })
+                  os_data = build_node_data(os_def, "openSearch_0", {
+                      "indexName": VECTOR_INDEX,
+                      "topK": 4,
+                      "output": "retriever"
+                  }, cred=cred_id)
+                  chain_data = build_node_data(chain_def, "convChain_0", {
+                      "systemMessagePrompt": (
+                          "You are an expert in analyzing OpenTelemetry logs "
+                          "and distributed tracing. Answer questions about "
+                          "system behavior, errors, performance issues, and "
+                          "service interactions based on the provided log excerpts."
+                      ),
+                      "returnSourceDocuments": True,
+                      "rephraseQuestion": True
+                  })
+
+                  flow_data = {
+                      "nodes": [
+                          {"id": "chatOllama_0", "type": "customNode",
+                           "position": {"x": 100, "y": 50},
+                           "data": chat_data, "width": 300, "height": 600},
+                          {"id": "ollamaEmbedding_0", "type": "customNode",
+                           "position": {"x": 100, "y": 700},
+                           "data": embed_data, "width": 300, "height": 400},
+                          {"id": "openSearch_0", "type": "customNode",
+                           "position": {"x": 550, "y": 300},
+                           "data": os_data, "width": 300, "height": 600},
+                          {"id": "convChain_0", "type": "customNode",
+                           "position": {"x": 1050, "y": 300},
+                           "data": chain_data, "width": 300, "height": 700}
+                      ],
+                      "edges": [
+                          {"id": "e_embed_os", "source": "ollamaEmbedding_0",
+                           "target": "openSearch_0",
+                           "sourceHandle": f"ollamaEmbedding_0-output-ollamaEmbedding-{'|'.join(embed_def['baseClasses'])}",
+                           "targetHandle": "openSearch_0-input-embeddings-Embeddings",
+                           "type": "buttonedge"},
+                          {"id": "e_os_chain", "source": "openSearch_0",
+                           "target": "convChain_0",
+                           "sourceHandle": f"openSearch_0-output-retriever-{'|'.join(os_def['outputs'][0]['baseClasses'])}",
+                           "targetHandle": "convChain_0-input-vectorStoreRetriever-VectorStoreRetriever|BaseRetriever",
+                           "type": "buttonedge"},
+                          {"id": "e_llm_chain", "source": "chatOllama_0",
+                           "target": "convChain_0",
+                           "sourceHandle": f"chatOllama_0-output-chatOllama-{'|'.join(chat_def['baseClasses'])}",
+                           "targetHandle": "convChain_0-input-model-BaseChatModel",
+                           "type": "buttonedge"}
+                      ],
+                      "viewport": {"x": 0, "y": 0, "zoom": 0.75}
+                  }
+
+                  new_flow = fw_req("POST", "/api/v1/chatflows", {
+                      "name": "OTEL Logs RAG",
+                      "flowData": json.dumps(flow_data),
+                      "type": "CHATFLOW"
+                  })
+                  flow_id = new_flow.get("id")
+                  if flow_id:
+                      print(f"  Created chatflow 'OTEL Logs RAG' (id: {flow_id})")
+                  else:
+                      print(f"  WARNING: chatflow creation: {new_flow}")
+
+              print(f"  Chatflow     : OTEL Logs RAG ({flow_id})")
           volumeMounts:
             - name: os-creds
               mountPath: /os-creds
