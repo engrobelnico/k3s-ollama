@@ -2,22 +2,30 @@
 
 User Question → LLM (embed) → OpenSearch kNN search → Context → LLM (generate) → Answer
 
-## les composants utilisés 
-Composant	Helm chart	Namespace
-Ollama (LLM local)	ollama-helm	ollama
-Open WebUI (interface chat)	open-webui	ollama
-LangChain app (orchestration)	custom	rag
+## les composants utilisés
+
+| Composant | Helm chart | Namespace |
+|---|---|---|
+| Ollama (LLM local) | ollama-helm | ollama |
+| Flowise (RAG builder / interface chat) | custom | ollama |
+
+## pipeline RAG
 
 otel-logs-* (texte brut)
-       ↓  Reindex Job
-rag-logs (kNN index avec embeddings)
+       ↓  Setup Job (PostSync)
+otel-rag-vectors (kNN index avec embeddings nomic-embed-text)
        ↓  Similarity search
-Open WebUI → Ollama (génération réponse)
+Flowise → Ollama (génération réponse)
 
-Après git push et déploiement, dans Open WebUI → Workspace > Knowledge → ajouter la collection rag-logs comme source RAG.
+## accès
+
+- Flowise : `http://flowise.kube.local`
+- Login : admin / (voir secret `flowise-auth` dans le namespace ollama)
 
 ## to rotate password
 
-sudo kubectl patch secret open-webui-admin -n ollama \
-  --type=merge -p "{\"data\":{\"password\":\"$(echo -n 'NewPass!' | base64)\"}}"
+```bash
+sudo kubectl patch secret flowise-auth -n ollama \
+  --type=merge -p '{"stringData":{"password":"NewPass!"}}'
+```
 
