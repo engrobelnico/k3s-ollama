@@ -9,6 +9,6 @@
 set -o errexit
 
 main () {
-    sudo kubectl -n ollama get secret anythingllm-auth -o jsonpath="{.data.token}" | base64 -d; echo
+    sudo kubectl -n ollama get secret flowise-auth -o jsonpath="{.data.password}" | base64 -d; echo
 }
 main "$@"
