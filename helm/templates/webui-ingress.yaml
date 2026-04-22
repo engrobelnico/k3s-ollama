@@ -1,4 +1,4 @@
-# Entry point: flowise.kube.local → Flowise (RAG on OTEL logs with OpenSearch)
+# Entry point: kube.local/flowise → Flowise (RAG on OTEL logs with OpenSearch)
 kind: Ingress
 apiVersion: networking.k8s.io/v1
 metadata:
@@ -9,10 +9,10 @@ metadata:
 spec:
   ingressClassName: traefik
   rules:
-    - host: flowise.kube.local
+    - host: kube.local
       http:
         paths:
-          - path: /
+          - path: /flowise
             pathType: Prefix
             backend:
               service:

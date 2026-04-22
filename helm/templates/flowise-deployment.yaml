@@ -35,6 +35,8 @@ spec:
           env:
             - name: PORT
               value: "3000"
+            - name: FLOWISE_BASE_URL
+              value: "/flowise"
             - name: FLOWISE_USERNAME
               valueFrom:
                 secretKeyRef:
@@ -70,7 +72,7 @@ spec:
               cpu: {{ .Values.flowise.resources.limits.cpu | quote }}
           readinessProbe:
             httpGet:
-              path: /api/v1/version
+              path: /flowise/api/v1/version
               port: 3000
             initialDelaySeconds: 20
             periodSeconds: 10

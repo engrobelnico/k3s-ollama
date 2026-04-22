@@ -51,7 +51,7 @@ ollama:
     port: 11434
 
 # Flowise — RAG builder with native OpenSearch VectorStore support
-# Access: http://flowise.kube.local (login with auth.username/password)
+# Access: http://kube.local/flowise (login with auth.username/password)
 # Setup job: creates otel-rag-vectors k-NN index, embeds OTEL logs, wires chatflow
 flowise:
   image:
