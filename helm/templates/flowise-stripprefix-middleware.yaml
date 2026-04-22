@@ -1,0 +1,10 @@
+# Traefik middleware: strip /flowise prefix before forwarding to backend
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: stripprefix-flowise
+  namespace: {{ .Release.Namespace }}
+spec:
+  stripPrefix:
+    prefixes:
+      - /flowise

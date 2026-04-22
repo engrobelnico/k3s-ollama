@@ -1,0 +1,62 @@
+---
+# Entry point: kube.local/flowise → Flowise (RAG on OTEL logs with OpenSearch)
+# /flowise → strip prefix → Flowise root (serves HTML)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: flowise-webui
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    traefik.ingress.kubernetes.io/router.middlewares: {{ .Release.Namespace }}-stripprefix-flowise@kubernetescrd
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: kube.local
+      http:
+        paths:
+          - path: /flowise
+            pathType: Prefix
+            backend:
+              service:
+                name: flowise
+                port:
+                  number: 3000
+---
+# SPA assets & API: Flowise HTML references /assets, /api/v1, /socket.io
+# with absolute paths — forward directly without prefix stripping
+# IMPORTANT: use /api/v1 (not /api) to avoid hijacking Traefik dashboard API
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: flowise-assets
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: kube.local
+      http:
+        paths:
+          - path: /assets
+            pathType: Prefix
+            backend:
+              service:
+                name: flowise
+                port:
+                  number: 3000
+          - path: /api/v1
+            pathType: Prefix
+            backend:
+              service:
+                name: flowise
+                port:
+                  number: 3000
+          - path: /socket.io
+            pathType: Prefix
+            backend:
+              service:
+                name: flowise
+                port:
+                  number: 3000
