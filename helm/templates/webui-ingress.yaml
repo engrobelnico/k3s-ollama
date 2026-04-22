@@ -30,9 +30,10 @@ spec:
       services:
         - name: flowise
           port: 3000
-    # SPA assets & API: Flowise HTML references /assets, /api, /socket.io
+    # SPA assets & API: Flowise HTML references /assets, /api/v1, /socket.io
     # with absolute paths — forward directly without prefix stripping
-    - match: Host(`kube.local`) && (PathPrefix(`/assets`) || PathPrefix(`/api`) || PathPrefix(`/socket.io`))
+    # IMPORTANT: use /api/v1 (not /api) to avoid hijacking Traefik dashboard API (/api/http/*, /api/overview, etc.)
+    - match: Host(`kube.local`) && (PathPrefix(`/assets`) || PathPrefix(`/api/v1`) || PathPrefix(`/socket.io`))
       kind: Rule
       services:
         - name: flowise
